@@ -3728,6 +3728,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                   max_batch_size=720,
                   **pytorch_config,
                   enable_attention_dp=attention_dp,
+                  print_iter_log=True,
                   moe_config=MoeConfig(backend=moe_backend))
 
         with llm:
@@ -3988,7 +3989,8 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,
                               cuda_graph_config=CudaGraphConfig())
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
-                                        dtype="auto")
+                                        dtype="auto",
+                                        use_kv_cache_manager_v2=False)
 
         eagle_model_dir = f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3"
         draft_len = 3

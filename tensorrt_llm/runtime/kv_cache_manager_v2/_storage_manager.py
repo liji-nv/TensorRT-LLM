@@ -298,7 +298,8 @@ class StorageManager:
                     )
             if old_free_cnt + evictable_cnt - fallen_held_cnt < goal:
                 raise OutOfPagesError(
-                    "Impossible to meet the goal ({goal} free slots) for group {pg_idx}"
+                    f"Impossible to meet the goal ({goal} free slots) for group {pg_idx}",
+                    f"old_free_cnt: {old_free_cnt}, evictable_cnt: {evictable_cnt}, fallen_held_cnt: {fallen_held_cnt}",
                 )
         evicted = ctrl.evict(num_to_evict)
         accepted_pages = make_typed(lambda: list[Page](), self.num_pool_groups)

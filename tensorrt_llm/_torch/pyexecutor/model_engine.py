@@ -911,7 +911,13 @@ class PyTorchModelEngine(ModelEngine):
             batch_size=batch_size, max_num_draft_tokens=draft_len)
 
         # Add one dummy request with the maximum possible sequence length.
-        token_num = max(1, min(available_tokens, self.max_seq_len - 1))
+        max_allowed_seq_len = min(self.max_seq_len,
+                                  kv_cache_manager.max_seq_len)
+        token_num = max(
+            1,
+            min(
+                available_tokens, max_allowed_seq_len - 1 -
+                get_num_extra_kv_tokens(self.spec_config) - draft_len))
         model_config = self.model.model_config.pretrained_config
         max_position_embeddings = getattr(model_config,
                                           'max_position_embeddings', None)
