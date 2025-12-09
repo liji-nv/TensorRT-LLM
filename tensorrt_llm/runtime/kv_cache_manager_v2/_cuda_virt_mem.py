@@ -55,7 +55,7 @@ class NativePhysMemAllocator:
 
 
 class PhysMem(ItemHolderWithSharedPool[drv.CUmemGenericAllocationHandle]):
-    SIZE: ClassVar[int] = 32 << 20
+    SIZE: ClassVar[int] = 2 << 20
     __slots__ = ()
 
 

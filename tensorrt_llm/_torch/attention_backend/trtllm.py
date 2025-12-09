@@ -480,7 +480,7 @@ class TrtllmAttentionWrapper:
             output,
             output_sf,
             out_dtype,
-            self.workspace,
+            None,
             self.sequence_length,
             self.host_past_key_value_lengths,
             self.host_total_kv_lens,

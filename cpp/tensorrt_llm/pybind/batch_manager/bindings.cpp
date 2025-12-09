@@ -168,6 +168,8 @@ void initBindings(pybind11::module_& m)
         .def_property(
             "context_current_position", &GenLlmReq::getContextCurrentPosition, &GenLlmReq::setContextCurrentPosition)
         .def_property_readonly("prepopulated_prompt_len", &GenLlmReq::getPrepopulatedPromptLen)
+        .def("set_prepopulated_prompt_len", &GenLlmReq::setPrepopulatedPromptLen, py::arg("prepopulated_prompt_len"),
+            py::arg("kv_tokens_per_block"))
         .def_property(
             "guided_decoding_params", &GenLlmReq::getGuidedDecodingParams, &GenLlmReq::setGuidedDecodingParams)
         .def_property_readonly("context_phase_params", &GenLlmReq::getContextPhaseParams)

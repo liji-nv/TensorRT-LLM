@@ -33,6 +33,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2._config import DataRole
 from tensorrt_llm.runtime.kv_cache_manager_v2._copy_engine import \
     copy_batch_block_offsets as copy_batch_block_offsets_nanobind
 from tensorrt_llm.runtime.kv_cache_manager_v2._utils import (exact_div,
+                                                             round_up,
                                                              typed_range)
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -452,9 +453,6 @@ class KVCacheManager(BaseResourceManager):
             # allocate KV Cache
             for req in context_batch:
                 req_beam_width = req.sampling_config.beam_width
-                # print(
-                #     f"prepare_resources: {req.py_request_id}, req.is_first_context_chunk: {req.is_first_context_chunk}, req.context_current_position: {req.context_current_position}, req.context_chunk_size: {req.context_chunk_size}, {req.cached_tokens}"
-                # )
                 if 'cp_type' in self.mapping.cp_config and CpType.STAR == self.mapping.cp_config[
                         'cp_type']:
                     if req.ctx_iters == 0:
@@ -471,9 +469,6 @@ class KVCacheManager(BaseResourceManager):
                         self.impl.add_sequence(req.py_request_id,
                                                req.prompt_len, req_beam_width,
                                                req)
-                        # print(
-                        #     f"after add sequence: {req.py_request_id}, {req.prompt_len}, {req.context_current_position}, {req.context_chunk_size}, {req.cached_tokens}"
-                        # )
                         for _ in range(self.num_extra_kv_tokens):
                             self.impl.add_token(req.py_request_id)
                         for _ in range(get_draft_token_length(req)):
@@ -1401,8 +1396,11 @@ class KVCacheManagerV2(BaseResourceManager):
 
         # Rough estimate of the quota needed for the KV cache
         # TODO: Consider vswa case
-        self.quota = GpuCacheTierConfig(
-            quota=int(max_tokens * self.get_cache_bytes_per_token()))
+        max_tokens = (max_tokens + tokens_per_block -
+                      1) // tokens_per_block * tokens_per_block
+        quota = max_tokens * self.get_cache_bytes_per_token()
+        quota = round_up(quota, 2 << 20)
+        self.quota = GpuCacheTierConfig(quota=int(quota))
 
         logger.info(
             f"Allocated {self.quota.quota / (1 << 30)} GiB in paged KV cache.")
@@ -1525,10 +1523,6 @@ class KVCacheManagerV2(BaseResourceManager):
                                  *,
                                  batch_size: int = 1,
                                  max_num_draft_tokens: int = 0) -> int:
-        if max_num_draft_tokens > 0:
-            raise ValueError(
-                "max_num_draft_tokens is not supported for KVCacheManagerV2")
-        # Multiplied by 0.95 to make `max_util_for_resume` happy
         return int(
             self.impl.clamp_max_seq_len_for_mem(batch_size) *
             self.kv_cache_manager_py_config.max_util_for_resume *
@@ -1575,6 +1569,9 @@ class KVCacheManagerV2(BaseResourceManager):
                             kv_cache.stop_committing()
                         else:
                             req.context_current_position = kv_cache.num_committed_tokens
+                            req.set_prepopulated_prompt_len(
+                                kv_cache.num_committed_tokens,
+                                self.tokens_per_block)
                             chunk_size = req.context_chunk_size
                             if req.context_current_position + req.context_chunk_size < req.prompt_len:
                                 floored_end_position = (
@@ -1591,7 +1588,8 @@ class KVCacheManagerV2(BaseResourceManager):
                             torch.cuda.current_stream().cuda_stream)
                         assert success
 
-                        kv_cache.capacity = req.prompt_len
+                        kv_cache.capacity = req.prompt_len + self.num_extra_kv_tokens + get_draft_token_length(
+                            req)
 
                         if self.kv_connector_manager is not None:
                             block_ids = self.get_cache_indices(req)
@@ -1600,7 +1598,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
             for req in generation_batch:
                 kv_cache = self.kv_cache_map[req.py_request_id]
-                kv_cache.capacity += 1
+                kv_cache.capacity += 1 + get_draft_token_length(req)
 
         if self.kv_connector_manager is not None:
             self.kv_connector_manager.build_scheduler_output(
@@ -1675,13 +1673,16 @@ class KVCacheManagerV2(BaseResourceManager):
                     self.free_resources(req)
                     return None
                 kv_cache.stop_committing()
-                kv_cache.capacity = token_num
+                kv_cache.capacity = token_num + self.num_extra_kv_tokens + num_extra_decoding_steps
                 self.kv_cache_map[req_id] = kv_cache
 
             if is_gen:
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
                 req.prompt_len = token_num - 1
                 req.py_prompt_len = req.prompt_len
+                req.py_draft_tokens = [1] * max_num_draft_tokens
+                if prepare_resource:
+                    kv_cache.capacity += max_num_draft_tokens
 
             # TODO: Planning to get dummy_data from each model. Before that, we need to add dummy mrop_config to the request here.
             if use_mrope:
