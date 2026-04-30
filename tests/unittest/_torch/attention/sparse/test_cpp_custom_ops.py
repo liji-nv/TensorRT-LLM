@@ -15,6 +15,7 @@
 """Unit tests for DSA C++ custom ops:
 
 - ``torch.ops.trtllm.indexer_k_cache_gather_op``
+- ``torch.ops.trtllm.indexer_k_cache_scatter_op``
 - ``torch.ops.trtllm.convert_req_index_to_global``
 """
 
@@ -116,6 +117,15 @@ def _create_4d_cache_and_mappings(
     return k_cache, slot_mapping_fp8, slot_mapping_scale
 
 
+def _scale_flat_slot_mapping(
+    slot_mapping: torch.Tensor, block_stride: int, page_index_scale: int
+) -> torch.Tensor:
+    """Scale physical block ids in flat slot mappings to page-index ids."""
+    block_idx = torch.div(slot_mapping, block_stride, rounding_mode="floor")
+    in_block_offset = slot_mapping - block_idx * block_stride
+    return block_idx * page_index_scale * block_stride + in_block_offset
+
+
 @pytest.mark.parametrize(
     "total_kv_len,num_blocks,block_size,k_token_start,num_tokens",
     [
@@ -152,7 +162,7 @@ def test_indexer_k_cache_gather_contiguous(
 
     # C++ op
     cpp_fp8, cpp_scale = torch.ops.trtllm.indexer_k_cache_gather_op(
-        k_cache, slot_fp8, slot_scale, k_token_start, num_tokens
+        k_cache, slot_fp8, slot_scale, k_token_start, num_tokens, 1
     )
 
     # Reference
@@ -219,7 +229,7 @@ def test_indexer_k_cache_gather_noncontiguous(
 
     # C++ op (handles non-contiguous strides internally)
     cpp_fp8, cpp_scale = torch.ops.trtllm.indexer_k_cache_gather_op(
-        k_cache_nc, slot_fp8, slot_scale, k_token_start, num_tokens
+        k_cache_nc, slot_fp8, slot_scale, k_token_start, num_tokens, 1
     )
 
     # Reference uses contiguous copy
@@ -237,6 +247,83 @@ def test_indexer_k_cache_gather_noncontiguous(
     )
 
 
+def test_indexer_k_cache_gather_page_index_scale():
+    """Gather applies the V2 page-index scale without scaling metadata."""
+    device = torch.device("cuda")
+    page_index_scale = 4
+    num_blocks = 8
+    block_size = 16
+    num_tokens = 64
+    per_token_size = BYTES_PER_TOKEN
+    block_stride = block_size * per_token_size
+
+    k_cache = torch.zeros(
+        (num_blocks * page_index_scale, block_size, 1, per_token_size),
+        dtype=torch.uint8,
+        device=device,
+    )
+    physical_cache, slot_fp8, slot_scale = _create_4d_cache_and_mappings(
+        num_tokens, num_blocks, block_size, per_token_size, device
+    )
+    k_cache[::page_index_scale] = physical_cache
+
+    cpp_fp8, cpp_scale = torch.ops.trtllm.indexer_k_cache_gather_op(
+        k_cache, slot_fp8, slot_scale, 0, num_tokens, page_index_scale
+    )
+
+    scaled_slot_fp8 = _scale_flat_slot_mapping(slot_fp8, block_stride, page_index_scale)
+    scaled_slot_scale = _scale_flat_slot_mapping(slot_scale, block_stride, page_index_scale)
+    ref_fp8, ref_scale = _reference_indexer_k_cache_gather(
+        k_cache, scaled_slot_fp8, scaled_slot_scale, 0, num_tokens
+    )
+
+    assert torch.equal(cpp_fp8.view(torch.uint8), ref_fp8.view(torch.uint8))
+    assert torch.equal(cpp_scale.view(torch.uint8), ref_scale.view(torch.uint8))
+
+
+def test_indexer_k_cache_scatter_page_index_scale():
+    """Scatter applies the V2 page-index scale without scaling metadata."""
+    device = torch.device("cuda")
+    page_index_scale = 4
+    num_blocks = 8
+    block_size = 16
+    num_tokens = 64
+    block_stride = block_size * BYTES_PER_TOKEN
+
+    k_cache = torch.zeros(
+        (num_blocks * page_index_scale, block_size, 1, BYTES_PER_TOKEN),
+        dtype=torch.uint8,
+        device=device,
+    )
+    expected = torch.zeros_like(k_cache)
+
+    total_slots = num_blocks * block_size
+    perm = torch.randperm(total_slots, device=device)[:num_tokens]
+    slot_fp8 = perm.to(torch.int64) * BYTES_PER_TOKEN
+    slot_scale = slot_fp8 + HEAD_DIM
+
+    k_fp8_bytes = torch.randint(0, 256, (num_tokens, HEAD_DIM), dtype=torch.uint8, device=device)
+    k_scale_bytes = torch.randint(
+        0, 256, (num_tokens, SCALE_BYTES), dtype=torch.uint8, device=device
+    )
+    k_fp8 = k_fp8_bytes.view(torch.float8_e4m3fn)
+    k_scale = k_scale_bytes.view(torch.float32).view(num_tokens, 1)
+
+    torch.ops.trtllm.indexer_k_cache_scatter_op(
+        k_fp8, k_scale, k_cache, slot_fp8, slot_scale, num_tokens, page_index_scale
+    )
+
+    flat_expected = expected.reshape(-1)
+    scaled_slot_fp8 = _scale_flat_slot_mapping(slot_fp8, block_stride, page_index_scale)
+    scaled_slot_scale = _scale_flat_slot_mapping(slot_scale, block_stride, page_index_scale)
+    byte_offsets_fp8 = torch.arange(HEAD_DIM, device=device, dtype=torch.int64)
+    byte_offsets_scale = torch.arange(SCALE_BYTES, device=device, dtype=torch.int64)
+    flat_expected[scaled_slot_fp8[:, None] + byte_offsets_fp8[None, :]] = k_fp8_bytes
+    flat_expected[scaled_slot_scale[:, None] + byte_offsets_scale[None, :]] = k_scale_bytes
+
+    assert torch.equal(k_cache, expected)
+
+
 def test_indexer_k_cache_gather_empty():
     """Zero-length gather should return correctly shaped empty tensors."""
     device = torch.device("cuda")
@@ -245,7 +332,7 @@ def test_indexer_k_cache_gather_empty():
     slot_scale = torch.zeros(10, dtype=torch.int64, device=device)
 
     k_fp8, k_scale = torch.ops.trtllm.indexer_k_cache_gather_op(
-        k_cache, slot_fp8, slot_scale, k_token_start=5, num_tokens=0
+        k_cache, slot_fp8, slot_scale, k_token_start=5, num_tokens=0, page_index_scale=1
     )
 
     assert k_fp8.shape == (0, HEAD_DIM)

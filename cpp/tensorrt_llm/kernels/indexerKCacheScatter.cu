@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -49,6 +49,18 @@ __device__ __forceinline__ int64_t flatIndexToMemoryOffset(
     return i0 * s0 + i1 * s1 + i2 * s2 + i3 * s3;
 }
 
+__device__ __forceinline__ int64_t scalePageIndex(int64_t flat_idx, int64_t block_stride, int32_t page_index_scale)
+{
+    if (page_index_scale == 1)
+    {
+        return flat_idx;
+    }
+
+    int64_t const block_idx = flat_idx / block_stride;
+    int64_t const in_block_offset = flat_idx - block_idx * block_stride;
+    return block_idx * page_index_scale * block_stride + in_block_offset;
+}
+
 } // anonymous namespace
 
 /**
@@ -71,12 +83,14 @@ __device__ __forceinline__ int64_t flatIndexToMemoryOffset(
  * @param cache_dim_1       Size of k_cache dimension 1
  * @param cache_dim_2       Size of k_cache dimension 2
  * @param cache_dim_3       Size of k_cache dimension 3
+ * @param page_index_scale  Scale from physical block id to V2 page index
  */
 __global__ void indexerKCacheScatterUnifiedKernel(uint8_t const* __restrict__ k_fp8_bytes,
     uint8_t const* __restrict__ k_scale_bytes, uint8_t* __restrict__ k_cache,
     int64_t const* __restrict__ slot_mapping_fp8, int64_t const* __restrict__ slot_mapping_scale, int32_t num_tokens,
     int32_t head_dim, int32_t scale_size, int64_t cache_stride_0, int64_t cache_stride_1, int64_t cache_stride_2,
-    int64_t cache_stride_3, int32_t cache_dim_0, int32_t cache_dim_1, int32_t cache_dim_2, int32_t cache_dim_3)
+    int64_t cache_stride_3, int32_t cache_dim_0, int32_t cache_dim_1, int32_t cache_dim_2, int32_t cache_dim_3,
+    int32_t page_index_scale)
 {
     // For head_dim=128, each thread handles 4 bytes/elements per read/write instruction
     constexpr int VEC_SIZE = 4;
@@ -99,6 +113,9 @@ __global__ void indexerKCacheScatterUnifiedKernel(uint8_t const* __restrict__ k_
 
     int32_t head_dim_idx = threadIdx.x * VEC_SIZE;
     int64_t flat_idx = flat_idx_fp8_base + head_dim_idx;
+    int64_t const block_stride = static_cast<int64_t>(cache_dim_1) * cache_dim_2 * cache_dim_3;
+    flat_idx = scalePageIndex(flat_idx, block_stride, page_index_scale);
+    flat_idx_scale_base = scalePageIndex(flat_idx_scale_base, block_stride, page_index_scale);
 
     // Convert flat index to memory offset using strides (k cache pool from cpp kv cache manager is non-contiguous)
     int64_t dst_offset = flatIndexToMemoryOffset(flat_idx, cache_dim_0, cache_dim_1, cache_dim_2, cache_dim_3,
@@ -124,7 +141,8 @@ __global__ void indexerKCacheScatterUnifiedKernel(uint8_t const* __restrict__ k_
 void invokeIndexerKCacheScatter(uint8_t const* k_fp8_bytes, uint8_t const* k_scale_bytes, uint8_t* k_cache,
     int64_t const* slot_mapping_fp8, int64_t const* slot_mapping_scale, int32_t num_tokens, int32_t head_dim,
     int32_t scale_size, int32_t cache_dim_0, int32_t cache_dim_1, int32_t cache_dim_2, int32_t cache_dim_3,
-    int64_t cache_stride_0, int64_t cache_stride_1, int64_t cache_stride_2, int64_t cache_stride_3, cudaStream_t stream)
+    int64_t cache_stride_0, int64_t cache_stride_1, int64_t cache_stride_2, int64_t cache_stride_3,
+    int32_t page_index_scale, cudaStream_t stream)
 {
     if (num_tokens == 0)
     {
@@ -137,6 +155,7 @@ void invokeIndexerKCacheScatter(uint8_t const* k_fp8_bytes, uint8_t const* k_sca
         head_dim == QUANT_BLOCK_SIZE, "head_dim must equal 128 for DeepSeek-V3 indexer cache (got %d)", head_dim);
     TLLM_CHECK_WITH_INFO(
         scale_size == 4, "scale_size must equal 4 bytes (1 float32 scale per token, got %d)", scale_size);
+    TLLM_CHECK_WITH_INFO(page_index_scale >= 1, "page_index_scale must be at least 1 (got %d)", page_index_scale);
 
     // For head_dim=128, we use 32 threads to handle 128 bytes per token and extra 4 bytes for scale
     constexpr int32_t THREADS_PER_BLOCK = 32;
@@ -146,7 +165,7 @@ void invokeIndexerKCacheScatter(uint8_t const* k_fp8_bytes, uint8_t const* k_sca
 
     indexerKCacheScatterUnifiedKernel<<<grid, block, 0, stream>>>(k_fp8_bytes, k_scale_bytes, k_cache, slot_mapping_fp8,
         slot_mapping_scale, num_tokens, head_dim, scale_size, cache_stride_0, cache_stride_1, cache_stride_2,
-        cache_stride_3, cache_dim_0, cache_dim_1, cache_dim_2, cache_dim_3);
+        cache_stride_3, cache_dim_0, cache_dim_1, cache_dim_2, cache_dim_3, page_index_scale);
 
     // Check for kernel launch errors
     TLLM_CUDA_CHECK(cudaGetLastError());

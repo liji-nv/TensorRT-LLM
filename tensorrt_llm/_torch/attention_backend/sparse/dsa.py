@@ -19,7 +19,9 @@ from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.multi_stream_utils import \
     maybe_execute_in_parallel
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._torch.pyexecutor.resource_manager import (KVCacheManager,
+                                                             KVCacheManagerV2,
+                                                             Role)
 from tensorrt_llm._torch.utils import maybe_compile
 from tensorrt_llm._utils import get_size_in_bytes, get_sm_version, prefer_pinned
 from tensorrt_llm.bindings import DataType
@@ -652,8 +654,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self._cached_tokens_per_block = kv_cache_manager.tokens_per_block
         head_dim = kv_cache_manager.head_dim
         self._cached_pool_view = pool.squeeze(2).view(-1, 1, head_dim)
-        self._cached_stride_factor = (num_layers *
-                                      self._cached_tokens_per_block)
+        self._cached_stride_factor = num_layers * self._cached_tokens_per_block
         self._cached_block_table_ctx = self.block_table[:self.num_contexts]
         self._cached_block_table_gen = self.block_table[self.num_contexts:self.
                                                         num_seqs]
@@ -725,32 +726,25 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                     non_blocking=True)
 
     def _get_pool_block_indices(self) -> torch.Tensor:
-        """Extract memory pool block indices from host_kv_cache_block_offsets.
+        """Extract memory pool block indices for the indexer K-cache.
 
-        The C++ setOffsets() encodes offsets as:
-            encoded = memPoolBlockIndex * numLayers * kvFactor
-        For SELFKONLY (MLA/DSA), kvFactor=1, so:
-            memPoolBlockIndex = encoded // num_local_layers
+        Delegates to the cache manager so V1 (``DSACacheManager``) and V2
+        (``DSACacheManagerV2``) can each provide their own decoding of
+        ``host_kv_cache_block_offsets`` (the encoding differs between the C++
+        KVCacheManagerCpp and the pure-Python KVCacheManagerPy).
 
-        Returns a (num_seqs, max_blocks_per_seq) int32 CPU tensor with valid
-        pool indices clamped to [0, blocks_in_primary_pool - 1].
+        Returns a ``(num_seqs, max_blocks_per_seq)`` int32 CPU tensor with
+        pool indices clamped to ``[0, blocks_in_primary_pool - 1]``.
         """
-        num_local_layers = self.kv_cache_manager.num_local_layers
-        max_pool_idx = self.kv_cache_manager.blocks_in_primary_pool - 1
-        # DSA uses SELFKONLY mode where only key cache is stored (kv_factor=1).
-        # host_kv_cache_block_offsets shape: (num_pools, max_batch*beam, 2, max_blocks_per_seq)
-        # Note: dim=2 is always 2 in the tensor layout (K and V slots), but for
-        # SELFKONLY only the K slot (index 0) contains valid data.
+        # DSA always runs in SELFKONLY mode regardless of cache backend.
         assert self.kv_cache_manager.kv_factor == 1, \
             f"DSA requires SELFKONLY mode (kv_factor=1), got kv_factor={self.kv_cache_manager.kv_factor}"
-        # Pool 0, first num_seqs entries, field 0 (key offsets)
-        encoded = self.kv_cache_manager.host_kv_cache_block_offsets[
-            0, :self.num_seqs, 0, :]
-        pool_indices = encoded // num_local_layers
-        # Clamp for safety: handles garbage padding from torch.empty in uninitialized slots
-        pool_indices = pool_indices.clamp(min=0,
-                                          max=max_pool_idx).to(torch.int32)
-        return pool_indices
+        return self.kv_cache_manager.get_pool_block_indices(
+            self.num_seqs,
+            request_ids=self.request_ids,
+            num_contexts=self.num_contexts,
+            beam_width=1,
+        )
 
     def prepare(self):
         """Prepare DSA metadata: compute slot mappings, block tables, and prefill chunks."""
@@ -1466,10 +1460,13 @@ class Indexer(nn.Module):
         # The C++ op reinterprets k_fp8 (FP8) and k_scale (float32) as raw
         # bytes internally and only reads the first num_tokens entries from
         # the slot mapping buffers, avoiding Python-side view/slice overhead.
+        page_index_scale = metadata.kv_cache_manager.get_indexer_k_cache_page_index_scale(
+            self.layer_idx)
         torch.ops.trtllm.indexer_k_cache_scatter_op(k_fp8, k_scale, k_cache,
                                                     metadata.slot_mapping_fp8,
                                                     metadata.slot_mapping_scale,
-                                                    num_tokens)
+                                                    num_tokens,
+                                                    page_index_scale)
 
     def sparse_attn_indexer(
         self,
@@ -1518,13 +1515,15 @@ class Indexer(nn.Module):
 
                 k_cache_4d = metadata.kv_cache_manager.get_indexer_k_cache_buffers(
                     self.layer_idx)
+                page_index_scale = metadata.kv_cache_manager.get_indexer_k_cache_page_index_scale(
+                    self.layer_idx)
 
                 for chunk in metadata.indexer_prefill_chunks:
                     num_k_tokens = chunk.k_token_end - chunk.k_token_start
                     chunk_k_fp8, chunk_k_scale = torch.ops.trtllm.indexer_k_cache_gather_op(
                         k_cache_4d, metadata.slot_mapping_fp8_fullkv,
                         metadata.slot_mapping_scale_fullkv, chunk.k_token_start,
-                        num_k_tokens)
+                        num_k_tokens, page_index_scale)
 
                     chunk_num_token = chunk.token_end - chunk.token_start
                     apply_q_split = q_split_eligible and chunk_num_token >= q_split_threshold
@@ -1662,6 +1661,8 @@ class Indexer(nn.Module):
             # [num_blocks, tokens_per_block, 1, head_dim + scale_size]
             k_cache = metadata.kv_cache_manager.get_indexer_k_cache_buffers(
                 self.layer_idx)
+            block_table = metadata.kv_cache_manager.scale_indexer_k_cache_block_table(
+                block_table, self.layer_idx)
 
             logits_decode = fp8_paged_mqa_logits(q_decode, k_cache,
                                                  weights_decode, context_lens,
@@ -2041,6 +2042,44 @@ class DSACacheManager(KVCacheManager):
         return self.indexer_k_cache_pool_per_layer[layer_offset].view(
             self.num_blocks, block_size, 1, per_token_size)
 
+    def get_indexer_k_cache_page_index_scale(self, layer_idx: int) -> int:
+        """Return the page-index scale needed by indexer K-cache consumers."""
+        return 1
+
+    def scale_indexer_k_cache_block_table(self, block_table: torch.Tensor,
+                                          layer_idx: int) -> torch.Tensor:
+        """Return a block table in the domain expected by paged logits."""
+        return block_table
+
+    def get_pool_block_indices(self,
+                               num_seqs: int,
+                               *,
+                               request_ids=None,
+                               num_contexts: int = 0,
+                               beam_width: int = 1) -> torch.Tensor:
+        """V1 decoding of host_kv_cache_block_offsets into pool block indices.
+
+        The C++ ``setOffsets()`` encodes offsets as:
+            ``encoded = memPoolBlockIndex * numLayers * kvFactor``
+        For SELFKONLY (DSA), ``kvFactor=1``, so:
+            ``memPoolBlockIndex = encoded // num_local_layers``
+
+        V1 fills ``host_kv_cache_block_offsets[0, :num_seqs, ...]`` in batch
+        order via ``copy_batch_block_offsets``, so ``request_ids`` is unused.
+
+        Returns a ``(num_seqs, max_blocks_per_seq)`` int32 CPU tensor with
+        pool indices clamped to ``[0, blocks_in_primary_pool - 1]``.
+        """
+        del request_ids, num_contexts, beam_width  # V1 uses batch ordering
+        num_local_layers = self.num_local_layers
+        max_pool_idx = self.blocks_in_primary_pool - 1
+        # Pool 0, first num_seqs entries, field 0 (key offsets).
+        encoded = self.host_kv_cache_block_offsets[0, :num_seqs, 0, :]
+        pool_indices = encoded // num_local_layers
+        # Clamp for safety: handles garbage padding from torch.empty in
+        # uninitialized slots.
+        return pool_indices.clamp(min=0, max=max_pool_idx).to(torch.int32)
+
     def shutdown(self):
         """Release indexer K-cache pool references before C++ buffer cleanup."""
         # Clear Python references BEFORE C++ frees the underlying CUDA buffers
@@ -2100,3 +2139,171 @@ class DSACacheManager(KVCacheManager):
                 quant_vector_size=16,
                 scaling_factor_dtype=DataType.FP8)
         return cache_size_bytes_per_token
+
+
+class DSACacheManagerV2(KVCacheManagerV2):
+    """KVCacheManagerV2-backed cache manager for DSA.
+
+    The indexer K-cache is allocated by ``KVCacheManagerV2`` itself as an
+    additional per-layer ``BufferConfig`` with role ``Role.INDEXER_K_CACHE``;
+    it lives in the same pool group as ``Role.KEY``, sharing the slot
+    allocator, lifecycle, host/disk tiering, and reuse with the K pool. No
+    sibling Python tensors are needed.
+    """
+
+    def __init__(
+        self,
+        kv_cache_config: KvCacheConfig,
+        kv_cache_type: CacheTypeCpp,
+        *,
+        num_layers: int,
+        num_kv_heads: Union[int, List[Optional[int]]],
+        head_dim: int,
+        tokens_per_block: int,
+        max_seq_len: int,
+        max_batch_size: int,
+        mapping: Mapping,
+        dtype: DataType = DataType.HALF,
+        spec_config: Optional["DecodingBaseConfig"] = None,
+        layer_mask: Optional[List[bool]] = None,
+        max_num_tokens: int = 8192,
+        model_config: Optional[ModelConfig] = None,
+        max_beam_width: int = 1,
+        sparse_attn_config: "SparseAttentionConfig",
+        **kwargs,
+    ) -> None:
+        self.quant_block_size = 128
+        self.index_head_dim = sparse_attn_config.index_head_dim
+
+        super().__init__(
+            kv_cache_config,
+            kv_cache_type,
+            num_layers=num_layers,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            tokens_per_block=tokens_per_block,
+            max_seq_len=max_seq_len,
+            max_batch_size=max_batch_size,
+            mapping=mapping,
+            dtype=dtype,
+            spec_config=spec_config,
+            layer_mask=layer_mask,
+            max_num_tokens=max_num_tokens,
+            model_config=model_config,
+            max_beam_width=max_beam_width,
+            enable_indexer_k_cache=True,
+            indexer_k_cache_quant_block_size=self.quant_block_size,
+            indexer_k_cache_index_head_dim=self.index_head_dim,
+            **kwargs,
+        )
+        self.num_blocks = self.blocks_in_primary_pool
+
+        # Indexer K cache pool tensors per local layer.
+        # Each entry is a uint8 view of the indexer pool's GPU buffer for the
+        # corresponding LOCAL layer offset (same indexing convention as V1's
+        # DSACacheManager). Shape:
+        #     (page_index_upper_bound, tokens_per_block * (index_head_dim + scale_size))
+        self.indexer_k_cache_pool_per_layer = [
+            self.get_indexer_k_cache_pool_data(local_layer_idx)
+            for local_layer_idx in range(self.num_local_layers)
+        ]
+
+    @property
+    def blocks_in_primary_pool(self) -> int:
+        """Return physical slot count for V1-compatible DSA block tables."""
+        page_index_scale = self.impl.get_page_index_scale(0, Role.KEY)
+        return self.impl.get_page_index_upper_bound(
+            0, Role.KEY) // page_index_scale
+
+    def get_indexer_k_cache_buffers(self, layer_idx: int):
+        """Get the indexer K-cache buffer for a specific (global) layer."""
+        block_size = self.tokens_per_block
+        per_token_size = self.index_head_dim + self.index_head_dim // self.quant_block_size * 4
+        layer_offset = self.layer_offsets[layer_idx]
+        tensor = self.indexer_k_cache_pool_per_layer[layer_offset]
+        return tensor.view(tensor.shape[0], block_size, 1, per_token_size)
+
+    def get_indexer_k_cache_page_index_scale(self, layer_idx: int) -> int:
+        """Return the V2 page-index scale for the indexer K-cache layer."""
+        layer_offset = self.layer_offsets[layer_idx]
+        return int(
+            self.impl.get_page_index_scale(layer_offset, Role.INDEXER_K_CACHE))
+
+    def scale_indexer_k_cache_block_table(self, block_table: torch.Tensor,
+                                          layer_idx: int) -> torch.Tensor:
+        """Return a temporary scaled block table for paged logits consumers."""
+        page_index_scale = self.get_indexer_k_cache_page_index_scale(layer_idx)
+        if page_index_scale == 1:
+            return block_table
+        return block_table * page_index_scale
+
+    def get_pool_block_indices(self,
+                               num_seqs: int,
+                               *,
+                               request_ids=None,
+                               num_contexts: int = 0,
+                               beam_width: int = 1) -> torch.Tensor:
+        """V2 decoding of host_kv_cache_block_offsets into pool block indices.
+
+        ``KVCacheManagerV2`` keeps ``host_kv_cache_block_offsets`` in a
+        stable per-request layout assigned by ``IndexMapper``; the current
+        batch's ordering is applied only by
+        ``copy_batch_block_offsets_to_device`` when filling the device
+        tensor. Reading ``[0, :num_seqs, 0, :]`` directly (as V1 does)
+        returns *stable* slots 0..num_seqs-1 which do not correspond to the
+        current batch — that causes cross-request KV cache aliasing for
+        concurrent batches.
+
+        Remap stable positions to current-batch order using
+        ``IndexMapper.get_copy_index(request_ids, num_contexts,
+        beam_width)``.  DSA keeps indexer block tables in the same domain as
+        V1: physical pool block ids for the per-layer indexer K-cache buffer.
+        """
+        assert request_ids is not None, (
+            "DSACacheManagerV2.get_pool_block_indices requires request_ids "
+            "to remap stable per-request positions to the current batch order")
+        max_pool_idx = self.blocks_in_primary_pool - 1
+        copy_idx = self.index_mapper.get_copy_index(list(request_ids),
+                                                    num_contexts, beam_width)
+        # ``get_copy_index`` returns a tensor; index host with CPU int64.
+        copy_idx = copy_idx.to(device="cpu", dtype=torch.long)
+        # Pool group 0, current-batch ordering via copy_idx, K slot (index 0).
+        block_indices = self.host_kv_cache_block_offsets[0, copy_idx, 0, :]
+        return block_indices.clamp(min=0, max=max_pool_idx).to(torch.int32)
+
+    def shutdown(self):
+        """Release indexer K-cache pool views before V2 frees the pool."""
+        # Drop Python references so VirtMem-backed buffers can be freed
+        # cleanly when KVCacheManagerPy.shutdown() destroys the storage.
+        self.indexer_k_cache_pool_per_layer = []
+        # KVCacheManagerV2 does not currently override shutdown(); call the
+        # base method only if it exists (forward compatibility).
+        base_shutdown = getattr(super(), "shutdown", None)
+        if callable(base_shutdown):
+            base_shutdown()
+
+    @staticmethod
+    def get_cache_size_per_token(model_config: ModelConfig,
+                                 mapping: Mapping,
+                                 num_layers: Optional[int] = None,
+                                 **kwargs):
+        """Estimate total cache bytes per token including indexer K-cache.
+
+        Mirrors :py:meth:`DSACacheManager.get_cache_size_per_token` so memory
+        budgeting (used by ``KvCacheCreator`` for quota estimation) matches
+        the actual V2 allocation, which now contains both the K pool and the
+        indexer pool inside the same pool group.
+        """
+        return DSACacheManager.get_cache_size_per_token(model_config,
+                                                        mapping,
+                                                        num_layers=num_layers,
+                                                        **kwargs)
+
+    def get_cache_bytes_per_token(self):
+        """Per-token cache bytes including the indexer pool.
+
+        The base ``KVCacheManagerV2.get_cache_bytes_per_token`` already
+        includes ``Role.INDEXER_K_CACHE`` because we added it to the
+        ``data_roles`` list when ``enable_indexer_k_cache`` is True.
+        """
+        return super().get_cache_bytes_per_token()

@@ -758,7 +758,7 @@ def test_indexer_k_cache_scatter_custom_op():
     torch.ops.trtllm.indexer_k_cache_scatter_op(k_fp8, k_scale, k_cache_cuda,
                                                 metadata.slot_mapping_fp8,
                                                 metadata.slot_mapping_scale,
-                                                num_tokens)
+                                                num_tokens, 1)
     torch.cuda.synchronize()
     print("✓ CUDA kernel completed")
 

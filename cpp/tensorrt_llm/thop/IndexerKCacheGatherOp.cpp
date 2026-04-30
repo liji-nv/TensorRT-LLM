@@ -29,7 +29,8 @@ namespace torch_ext
 {
 
 std::tuple<th::Tensor, th::Tensor> indexer_k_cache_gather_op(th::Tensor const& k_cache,
-    th::Tensor const& slot_mapping_fp8, th::Tensor const& slot_mapping_scale, int64_t k_token_start, int64_t num_tokens)
+    th::Tensor const& slot_mapping_fp8, th::Tensor const& slot_mapping_scale, int64_t k_token_start, int64_t num_tokens,
+    int64_t page_index_scale)
 {
     constexpr int32_t HEAD_DIM = 128;
     constexpr int32_t SCALE_SIZE = 4;
@@ -79,6 +80,7 @@ std::tuple<th::Tensor, th::Tensor> indexer_k_cache_gather_op(th::Tensor const& k
 
     // Validation for indexer k cache pool for DeepSeek-V3.2 constraints
     TORCH_CHECK(cache_dim_2 == 1, "k_cache dimension 2 must be 1 for DeepSeek-V3.2, got %d", cache_dim_2);
+    TORCH_CHECK(page_index_scale >= 1, "page_index_scale must be at least 1, got %ld", page_index_scale);
 
     int64_t cache_stride_0 = static_cast<int64_t>(k_cache.stride(0));
     int64_t cache_stride_1 = static_cast<int64_t>(k_cache.stride(1));
@@ -95,7 +97,8 @@ std::tuple<th::Tensor, th::Tensor> indexer_k_cache_gather_op(th::Tensor const& k
     tk::invokeIndexerKCacheGather(k_cache.data_ptr<uint8_t>(), slot_mapping_fp8.data_ptr<int64_t>(),
         slot_mapping_scale.data_ptr<int64_t>(), out_fp8.data_ptr<uint8_t>(), out_scale.data_ptr<uint8_t>(),
         static_cast<int32_t>(k_token_start), num_tokens_i32, HEAD_DIM, SCALE_SIZE, cache_dim_0, cache_dim_1,
-        cache_dim_2, cache_dim_3, cache_stride_0, cache_stride_1, cache_stride_2, cache_stride_3, stream);
+        cache_dim_2, cache_dim_3, cache_stride_0, cache_stride_1, cache_stride_2, cache_stride_3,
+        static_cast<int32_t>(page_index_scale), stream);
 
     // View-cast to final dtypes (no copy)
     auto k_fp8 = out_fp8.view(torch::kFloat8_e4m3fn);
@@ -112,7 +115,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "indexer_k_cache_gather_op(Tensor k_cache, Tensor slot_mapping_fp8, "
-        "Tensor slot_mapping_scale, int k_token_start, int num_tokens) -> (Tensor, Tensor)");
+        "Tensor slot_mapping_scale, int k_token_start, int num_tokens, int page_index_scale) -> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

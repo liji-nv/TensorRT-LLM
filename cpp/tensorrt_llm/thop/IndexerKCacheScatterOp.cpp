@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -29,7 +29,8 @@ namespace torch_ext
 {
 
 void indexer_k_cache_scatter_op(th::Tensor const& k_fp8, th::Tensor const& k_scale, th::Tensor& k_cache,
-    th::Tensor const& slot_mapping_fp8, th::Tensor const& slot_mapping_scale, int64_t num_tokens)
+    th::Tensor const& slot_mapping_fp8, th::Tensor const& slot_mapping_scale, int64_t num_tokens,
+    int64_t page_index_scale)
 {
     // k_fp8: [>=num_tokens, head_dim] in FP8 (1 byte/element) — reinterpreted as uint8
     // k_scale: [>=num_tokens, head_dim // quant_block_size] in float32 — reinterpreted as uint8 bytes
@@ -73,6 +74,7 @@ void indexer_k_cache_scatter_op(th::Tensor const& k_fp8, th::Tensor const& k_sca
     TORCH_CHECK(cache_dim_2 == 1, "k_cache dimension 2 must be 1, got %d", cache_dim_2);
     TORCH_CHECK(head_dim == 128, "k_fp8 head_dim must be 128, got %d", head_dim);
     TORCH_CHECK(scale_size == 4, "k_scale scale_size must be 4 bytes, got %d", scale_size);
+    TORCH_CHECK(page_index_scale >= 1, "page_index_scale must be at least 1, got %ld", page_index_scale);
 
     int64_t const cache_stride_0 = static_cast<int64_t>(k_cache.stride(0));
     int64_t const cache_stride_1 = static_cast<int64_t>(k_cache.stride(1));
@@ -87,7 +89,7 @@ void indexer_k_cache_scatter_op(th::Tensor const& k_fp8, th::Tensor const& k_sca
         reinterpret_cast<uint8_t const*>(k_scale.data_ptr()), k_cache.data_ptr<uint8_t>(),
         slot_mapping_fp8.data_ptr<int64_t>(), slot_mapping_scale.data_ptr<int64_t>(), static_cast<int32_t>(num_tokens),
         head_dim, scale_size, cache_dim_0, cache_dim_1, cache_dim_2, cache_dim_3, cache_stride_0, cache_stride_1,
-        cache_stride_2, cache_stride_3, stream);
+        cache_stride_2, cache_stride_3, static_cast<int32_t>(page_index_scale), stream);
 }
 
 } // namespace torch_ext
@@ -98,7 +100,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "indexer_k_cache_scatter_op(Tensor k_fp8, Tensor k_scale, Tensor(a!) k_cache, "
-        "Tensor slot_mapping_fp8, Tensor slot_mapping_scale, int num_tokens) -> ()");
+        "Tensor slot_mapping_fp8, Tensor slot_mapping_scale, int num_tokens, int page_index_scale) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

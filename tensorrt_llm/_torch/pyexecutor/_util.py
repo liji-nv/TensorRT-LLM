@@ -56,12 +56,23 @@ def ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
-def get_kv_cache_manager_cls(model_config: ModelConfig,
-                             kv_cache_config: KvCacheConfig):
+def get_kv_cache_manager_cls(
+        model_config: ModelConfig,
+        kv_cache_config: KvCacheConfig,
+        *,
+        mapping: Optional[Mapping] = None,
+        max_beam_width: int = 1,
+        kv_connector_manager: Optional[KvCacheConnectorManager] = None):
     config = model_config.pretrained_config
     sparse_attn_config = model_config.sparse_attention_config
     if sparse_attn_config is not None:
-        return get_sparse_attn_kv_cache_manager(sparse_attn_config)
+        return get_sparse_attn_kv_cache_manager(
+            sparse_attn_config,
+            kv_cache_config=kv_cache_config,
+            mapping=mapping,
+            max_beam_width=max_beam_width,
+            kv_connector_manager=kv_connector_manager,
+        )
     elif is_hybrid_linear(config):
         return MambaHybridCacheManager
     else:
@@ -127,20 +138,12 @@ class KvCacheCreator:
         self._skip_est = skip_est
 
     def _get_model_kv_cache_manager_cls(self, model_engine: PyTorchModelEngine):
-        cls = get_kv_cache_manager_cls(model_engine.model.model_config,
-                                       self._kv_cache_config)
-        if cls == KVCacheManagerV2:
-            if self._kv_connector_manager is not None or (
-                    self._max_beam_width is not None and self._max_beam_width
-                    > 1) or self._kv_cache_config.event_buffer_max_size > 0 or (
-                        self._cache_transceiver_config is not None
-                        and self._cache_transceiver_config.backend is not None):
-                logger.warning(
-                    "KVCacheManagerV2 is not supported with kv_connector_manager, beam width > 1, "
-                    "event buffer max size > 0, or cache transceiver. Falling back to KVCacheManager."
-                )
-                cls = KVCacheManager
-        return cls
+        return get_kv_cache_manager_cls(
+            model_engine.model.model_config,
+            self._kv_cache_config,
+            mapping=self._mapping,
+            max_beam_width=self._max_beam_width or 1,
+            kv_connector_manager=self._kv_connector_manager)
 
     def _get_kv_size_per_token(self):
         model_config = self._model_engine.model.model_config
@@ -683,7 +686,11 @@ class KvCacheCreator:
 
         # Get the appropriate KV cache manager class for the draft model
         draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
-            effective_draft_config, self._kv_cache_config)
+            effective_draft_config,
+            self._kv_cache_config,
+            mapping=self._mapping,
+            max_beam_width=self._max_beam_width or 1,
+            kv_connector_manager=self._kv_connector_manager)
 
         # Use V2 if enabled and the base class is KVCacheManager
         if draft_kv_cache_manager_cls == KVCacheManagerV2:

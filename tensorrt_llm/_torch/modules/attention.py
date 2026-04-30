@@ -1790,6 +1790,47 @@ class MLA(nn.Module):
             q, compressed_kv, k_pe, latent_cache, q_fp8, k_fp8, k_scale, weights
         ]
 
+    def _dsa_dump(self, name: str, t: Optional[torch.Tensor]) -> None:
+        """Dump tensor to DSA_DUMP_DIR if set. Gated by /tmp/dsa_dump_active
+        sentinel so warmup iterations are skipped. Each (layer, name) keeps
+        an incrementing step counter per rank."""
+        import os
+        dump_dir = os.environ.get("DSA_DUMP_DIR")
+        if not dump_dir or t is None:
+            return
+        if not os.path.exists("/tmp/dsa_dump_active"):
+            return
+        try:
+            os.makedirs(dump_dir, exist_ok=True)
+            rank = int(
+                os.environ.get("RANK",
+                               os.environ.get("OMPI_COMM_WORLD_RANK", "0")))
+            layer = getattr(self, "layer_idx", -1)
+            # Per-process monotonic counter per (layer, name) to distinguish
+            # prefill vs. each decode step.
+            if not hasattr(self, "_dsa_dump_counters"):
+                self._dsa_dump_counters = {}
+            key = (layer, name)
+            step = self._dsa_dump_counters.get(key, 0)
+            self._dsa_dump_counters[key] = step + 1
+            # Only the first few steps per layer to keep output small.
+            if step >= 3:
+                return
+            sample = t.detach()
+            if sample.dim() >= 2:
+                sample = sample.flatten(0, -2)[:64, :128]
+            else:
+                sample = sample[:64]
+            path = (f"{dump_dir}/rank{rank}_layer{layer}_step{step}_{name}.pt")
+            torch.save(
+                {
+                    "shape": tuple(t.shape),
+                    "dtype": str(t.dtype),
+                    "sample": sample.cpu(),
+                }, path)
+        except Exception as e:
+            print(f"[DSA_DUMP_ERROR] {e}")
+
     def forward_dsa_attn(
         self,
         q: torch.Tensor,
@@ -1838,6 +1879,10 @@ class MLA(nn.Module):
             k_fp8 = k_fp8[:num_tokens, ...]
             k_scale = k_scale[:num_tokens, ...]
             weights = weights[:num_tokens, ...]
+            self._dsa_dump("indexer_q_fp8_in", q_fp8)
+            self._dsa_dump("indexer_k_fp8_in", k_fp8)
+            self._dsa_dump("indexer_k_scale_in", k_scale)
+            self._dsa_dump("indexer_weights_in", weights)
             topk_indices = self.mqa.indexer.sparse_attn_indexer(
                 attn_metadata,
                 q,  # only used for shape/device in buffer allocation
@@ -1846,6 +1891,7 @@ class MLA(nn.Module):
                 k_scale,
                 weights,
             )
+            self._dsa_dump("indexer_topk_out", topk_indices)
 
         assert output is not None, "output must be provided"
 
@@ -1858,6 +1904,9 @@ class MLA(nn.Module):
                 assert position_ids is not None
                 k_pe_ctx = self.apply_rope(q_ctx, k_pe_ctx, position_ids)
 
+            self._dsa_dump("ctx_q_in", q_ctx)
+            self._dsa_dump("ctx_compressed_kv_in", compressed_kv_ctx)
+            self._dsa_dump("ctx_k_pe_in", k_pe_ctx)
             self.forward_context_dsa(
                 q_ctx,
                 compressed_kv_ctx,
@@ -1869,6 +1918,7 @@ class MLA(nn.Module):
                 if topk_indices is not None else None,
                 position_ids=position_ids,
             )
+            self._dsa_dump("ctx_attn_out", output[:num_ctx_tokens, :])
 
         if num_generations > 0:
             q_gen = q[num_ctx_tokens:, ...]
@@ -1879,6 +1929,9 @@ class MLA(nn.Module):
                 assert position_ids is not None
                 k_pe_gen = self.apply_rope(q_gen, k_pe_gen, position_ids)
 
+            self._dsa_dump("gen_q_in", q_gen)
+            self._dsa_dump("gen_compressed_kv_in", compressed_kv_gen)
+            self._dsa_dump("gen_k_pe_in", k_pe_gen)
             self.forward_generation_dsa(
                 q_gen,
                 compressed_kv_gen,
@@ -1888,6 +1941,7 @@ class MLA(nn.Module):
                 latent_cache_gen,
                 topk_indices=topk_indices[num_ctx_tokens:num_tokens, :],
             )
+            self._dsa_dump("gen_attn_out", output[num_ctx_tokens:num_tokens, :])
 
     def forward_context_default(
         self,

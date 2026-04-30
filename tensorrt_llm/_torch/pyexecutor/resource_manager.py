@@ -88,6 +88,10 @@ class Role:
     VALUE = DataRole("value")
     KEY_BLOCK_SCALE = DataRole("key_block_scale")
     VALUE_BLOCK_SCALE = DataRole("value_block_scale")
+    # Per-layer FP8 indexer K-cache used by DeepSeek Sparse Attention (DSA).
+    # Lives in the same pool group / life cycle as Role.KEY (page indices are
+    # shared) but in its own coalesced pool with a different slot size.
+    INDEXER_K_CACHE = DataRole("indexer_k_cache")
     ALL = DataRole("all")
 
 
@@ -1735,6 +1739,14 @@ class KVCacheManagerV2(BaseResourceManager):
         is_draft: bool = False,
         kv_connector_manager: Optional[KvCacheConnectorManager] = None,
         execution_stream: Optional[torch.cuda.Stream] = None,
+        # DSA indexer K-cache support (only enabled by DSACacheManagerV2).
+        # When True, an extra per-layer buffer with role Role.INDEXER_K_CACHE
+        # is added to each layer's BufferConfig list. The runtime allocates a
+        # sibling pool inside the same pool group as Role.KEY, sharing slot
+        # indices, lifecycle, host/disk tiering, and reuse with the K pool.
+        enable_indexer_k_cache: bool = False,
+        indexer_k_cache_quant_block_size: int = 128,
+        indexer_k_cache_index_head_dim: int = 0,
         **kwargs,
     ) -> None:
         self.mapping = mapping
@@ -1744,6 +1756,21 @@ class KVCacheManagerV2(BaseResourceManager):
         assert max_beam_width == 1, "max_beam_width must be 1 for KVCacheManagerV2"
         assert not (mapping.cp_config.get('cp_type') == CpType.STAR), \
             "Star attention is not supported for KVCacheManagerV2"
+
+        # DSA indexer K-cache parameters. Stored on self so _build_cache_config
+        # and get_layer_bytes_per_token can size the indexer buffer.
+        self.enable_indexer_k_cache = enable_indexer_k_cache
+        self.indexer_k_cache_quant_block_size = indexer_k_cache_quant_block_size
+        self.indexer_k_cache_index_head_dim = indexer_k_cache_index_head_dim
+        if enable_indexer_k_cache:
+            assert indexer_k_cache_index_head_dim > 0, \
+                "indexer_k_cache_index_head_dim must be > 0 when enable_indexer_k_cache is True"
+            assert indexer_k_cache_quant_block_size > 0 and \
+                indexer_k_cache_index_head_dim % indexer_k_cache_quant_block_size == 0, \
+                "indexer_k_cache_index_head_dim must be a positive multiple of " \
+                "indexer_k_cache_quant_block_size"
+            assert kv_cache_type == CacheTypeCpp.SELFKONLY, \
+                "DSA indexer K-cache requires SELFKONLY cache type"
 
         self.kv_cache_type = kv_cache_type
         self.pp_layers, self.num_layers = get_pp_layers(
@@ -2076,6 +2103,11 @@ class KVCacheManagerV2(BaseResourceManager):
             buffer_type.append(Role.KEY_BLOCK_SCALE)
             if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
                 buffer_type.append(Role.VALUE_BLOCK_SCALE)
+        if self.enable_indexer_k_cache:
+            # Indexer pool joins the same pool group as Role.KEY (same life
+            # cycle = same sliding-window config). Lifecycle and reuse are
+            # automatic via the shared SlotAllocator.
+            buffer_type.append(Role.INDEXER_K_CACHE)
 
         return KVCacheManagerConfigPy(
             tokens_per_block=tokens_per_block,
@@ -2154,6 +2186,93 @@ class KVCacheManagerV2(BaseResourceManager):
             dtype,
             shape,
         ))
+
+    def get_unique_primary_pool(self) -> torch.Tensor:
+        """V1-parity accessor returning a single 4D view over the K pool.
+
+        Shape: ``[num_blocks, num_local_layers, kv_factor,
+                  tokens_per_block * num_kv_heads * head_dim // element_per_container]``
+
+        Assumes all local layers share one pool group with buffers laid out
+        contiguously within each slot (layer 0 immediately followed by layer
+        1, ...). That layout is what ``KVCacheManagerPy`` produces today for a
+        single pool group with uniform per-layer buffer sizes (e.g. MLA
+        SELFKONLY, or standard MHA with uniform head counts).
+        """
+        assert self.num_local_layers > 0, "No local layers present"
+
+        # Uniformity checks: all local layers must have the same kv-head count
+        # for a single unique pool to make sense. Heterogeneous head counts
+        # would need per-pool handling (use get_buffers(layer_idx) instead).
+        num_kv_heads = self.num_kv_heads_per_layer[0]
+        assert all(h == num_kv_heads for h in self.num_kv_heads_per_layer), \
+            "get_unique_primary_pool requires uniform num_kv_heads across local layers"
+
+        element_per_container = 1
+        dtype = self.dtype
+        if dtype == DataType.NVFP4:
+            element_per_container = 2
+            dtype = torch.int8
+
+        elem_size = convert_to_torch_tensor(TensorWrapper(0, dtype,
+                                                          [0])).element_size()
+
+        page_index_scale = self.impl.get_page_index_scale(0, Role.KEY)
+        num_blocks = exact_div(
+            self.impl.get_page_index_upper_bound(0, Role.KEY), page_index_scale)
+        per_layer_per_slot = (self.kv_factor * self.tokens_per_block *
+                              num_kv_heads * self.head_dim //
+                              element_per_container)
+        per_layer_bytes = per_layer_per_slot * elem_size
+
+        # Verify layers are contiguous within each slot; otherwise a single
+        # flat tensor view would alias unrelated memory.
+        base_addr = self.impl.get_mem_pool_base_address(0, Role.KEY)
+        for layer_offset in range(1, self.num_local_layers):
+            addr = self.impl.get_mem_pool_base_address(layer_offset, Role.KEY)
+            expected = base_addr + layer_offset * per_layer_bytes
+            assert int(addr) == int(expected), (
+                f"get_unique_primary_pool: layer {layer_offset} base "
+                f"{int(addr):#x} != expected {int(expected):#x} "
+                f"(layers are not contiguous within a slot)")
+
+        shape = [
+            num_blocks,
+            self.num_local_layers,
+            self.kv_factor,
+            self.tokens_per_block * num_kv_heads * self.head_dim //
+            element_per_container,
+        ]
+
+        return convert_to_torch_tensor(TensorWrapper(base_addr, dtype, shape))
+
+    def get_indexer_k_cache_pool_data(self,
+                                      local_layer_idx: int) -> torch.Tensor:
+        """Return the indexer K-cache pool tensor for a given LOCAL layer.
+
+        Mirrors ``KVCacheManager.get_indexer_k_cache_pool_data`` (V1), which
+        also accepts a local layer index. ``DSACacheManagerV2`` iterates
+        ``range(num_local_layers)`` in its ``__init__`` to populate
+        ``indexer_k_cache_pool_per_layer``, matching the V1 layout.
+
+        The returned tensor is a uint8 view of the indexer pool for
+        ``local_layer_idx`` in V2 page-index order, shaped
+        ``(page_index_upper_bound, tokens_per_block * per_token_size)``.
+        Callers that hold physical block ids must apply ``page_index_scale``
+        at the consumer boundary.
+        """
+        assert self.enable_indexer_k_cache, \
+            "Indexer K-cache is not enabled on this KVCacheManagerV2 instance"
+        addr = self.impl.get_mem_pool_base_address(local_layer_idx,
+                                                   Role.INDEXER_K_CACHE)
+        page_index_upper_bound = self.impl.get_page_index_upper_bound(
+            local_layer_idx, Role.INDEXER_K_CACHE)
+        per_token_size = self.get_layer_bytes_per_token(
+            local_layer_idx=local_layer_idx, data_role=Role.INDEXER_K_CACHE)
+        flat_per_block = self.tokens_per_block * per_token_size
+        return convert_to_torch_tensor(
+            TensorWrapper(addr, torch.uint8,
+                          [page_index_upper_bound, flat_per_block]))
 
     def get_num_available_tokens(self,
                                  *,
@@ -2700,6 +2819,8 @@ class KVCacheManagerV2(BaseResourceManager):
             data_roles.append(Role.KEY_BLOCK_SCALE)
             if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
                 data_roles.append(Role.VALUE_BLOCK_SCALE)
+        if self.enable_indexer_k_cache:
+            data_roles.append(Role.INDEXER_K_CACHE)
 
         return sum(
             self.get_layer_bytes_per_token(local_layer_idx=local_layer_idx,
@@ -2708,6 +2829,15 @@ class KVCacheManagerV2(BaseResourceManager):
             for data_role in data_roles)
 
     def get_layer_bytes_per_token(self, local_layer_idx: int, data_role: Role):
+        if data_role == Role.INDEXER_K_CACHE:
+            # FP8 quantized index head + per-quant-block FP32 scale.
+            # Layout matches V1 KVCacheManagerCpp's indexer K-cache exactly:
+            # per_token_size = index_head_dim + (index_head_dim/quant_block_size)*4
+            index_head_dim = self.indexer_k_cache_index_head_dim
+            quant_block_size = self.indexer_k_cache_quant_block_size
+            assert index_head_dim > 0, \
+                "indexer_k_cache_index_head_dim must be set when querying INDEXER_K_CACHE bytes"
+            return index_head_dim + (index_head_dim // quant_block_size) * 4
         if self.dtype not in (
                 DataType.FP8,
                 DataType.HALF,

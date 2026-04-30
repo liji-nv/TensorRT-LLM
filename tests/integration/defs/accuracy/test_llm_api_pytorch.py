@@ -3051,19 +3051,22 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
             "baseline", "baseline_mtp1", "baseline_fp8kv", "latency",
             "latency_default", "disable_skip_indexer", "heuristic_topk_mtp1"
         ])
+    @parametrize_with_ids("v2_kv_cache", [True, False])
     def test_fp8_blockscale(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                             attention_dp, cuda_graph, overlap_scheduler,
                             max_batch_size, moe_backend, disable_skip_indexer,
-                            enable_heuristic_topk):
+                            enable_heuristic_topk, v2_kv_cache):
         if get_sm_version() == 100 or get_sm_version() == 103:
             moe_backend = "DEEPGEMM" if moe_backend == "_DEFAULT" else moe_backend
             moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
-            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
+            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
+                                            use_kv_cache_manager_v2=v2_kv_cache)
         else:
             if moe_backend != "_DEFAULT":
                 pytest.skip("Not supported MoE backend!")
             moe_config = MoeConfig()
-            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
+            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
+                                            use_kv_cache_manager_v2=v2_kv_cache)
 
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
@@ -3130,9 +3133,11 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
             "host_cache_offload", "host_cache_offload_mtp1",
             "host_cache_offload_mtp3_no_adp"
         ])
+    @parametrize_with_ids("v2_kv_cache", [True, False])
     def test_dsa_host_cache_offload(self, tp_size, pp_size, ep_size, mtp_nextn,
                                     overlap_scheduler, max_batch_size,
-                                    host_cache_size_gb, attention_dp):
+                                    host_cache_size_gb, attention_dp,
+                                    v2_kv_cache):
         """Validate DSA host-offloading for both pools (MLA KV cache + indexer-K cache)."""
         if get_sm_version() == 100 or get_sm_version() == 103:
             moe_config = MoeConfig(backend="DEEPGEMM", max_num_tokens=16384)
@@ -3143,6 +3148,7 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
         kv_cache_config = KvCacheConfig(
             free_gpu_memory_fraction=0.4,
             host_cache_size=host_cache_size_gb * (1 << 30),
+            use_kv_cache_manager_v2=v2_kv_cache,
         )
 
         pytorch_config = dict(
@@ -3171,26 +3177,66 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @pytest.mark.skip_less_mpi_world_size(8)
     @skip_pre_blackwell
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,mtp_nextn,attention_dp,max_batch_size,moe_backend,fp8kv,chunked_prefill",
         [
-            (8, 1, 8, 0, True, 24, "CUTLASS", False, False),
-            (8, 1, 8, 3, False, 16, "TRTLLM", True, True),
+            pytest.param(8,
+                         1,
+                         8,
+                         0,
+                         True,
+                         24,
+                         "CUTLASS",
+                         False,
+                         False,
+                         marks=pytest.mark.skip_less_mpi_world_size(8)),
+            pytest.param(8,
+                         1,
+                         8,
+                         3,
+                         False,
+                         16,
+                         "TRTLLM",
+                         True,
+                         True,
+                         marks=pytest.mark.skip_less_mpi_world_size(8)),
+            pytest.param(4,
+                         1,
+                         4,
+                         0,
+                         True,
+                         24,
+                         "CUTLASS",
+                         False,
+                         False,
+                         marks=pytest.mark.skip_less_mpi_world_size(4)),
+            pytest.param(4,
+                         1,
+                         4,
+                         3,
+                         False,
+                         16,
+                         "TRTLLM",
+                         True,
+                         True,
+                         marks=pytest.mark.skip_less_mpi_world_size(4)),
         ],
-        ids=["baseline", "mtp3_fp8kv_chunked"])
-    def test_nvfp4_multi_gpus_piecewise_cuda_graph(self, tp_size, pp_size,
-                                                   ep_size, mtp_nextn,
-                                                   attention_dp, max_batch_size,
-                                                   moe_backend, fp8kv,
-                                                   chunked_prefill):
+        ids=[
+            "baseline", "mtp3_fp8kv_chunked", "baseline_tp4",
+            "mtp3_fp8kv_chunked_tp4"
+        ])
+    @parametrize_with_ids("v2_kv_cache", [True, False])
+    def test_nvfp4_multi_gpus_piecewise_cuda_graph(
+            self, tp_size, pp_size, ep_size, mtp_nextn, attention_dp,
+            max_batch_size, moe_backend, fp8kv, chunked_prefill, v2_kv_cache):
         sm_version = get_sm_version()
         if moe_backend == "TRTLLM" and sm_version in (120, 121):
             pytest.skip(f"{moe_backend} backend does not support SM 120 or 121")
 
         moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
+                                        use_kv_cache_manager_v2=v2_kv_cache)
         if fp8kv:
             kv_cache_config.dtype = "fp8"
             kv_cache_config.enable_block_reuse = True
@@ -3238,32 +3284,161 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @pytest.mark.skip_less_mpi_world_size(8)
     @skip_pre_blackwell
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend,disable_skip_indexer",
         [
-            (8, 1, 8, 0, False, True, True, True, 24, "CUTLASS", False),
-            (8, 1, 8, 1, False, True, True, True, 24, "CUTLASS", False),
-            (8, 1, 8, 0, True, True, True, True, 24, "CUTLASS", False),
-            (8, 1, 8, 3, False, False, True, True, 1, "TRTLLM", False),
-            (8, 1, 8, 1, False, True, True, True, 24, "CUTLASS", True),
-            (1, 4, 1, 1, False, False, True, True, 24, "TRTLLM", False),
+            pytest.param(8,
+                         1,
+                         8,
+                         0,
+                         False,
+                         True,
+                         True,
+                         True,
+                         24,
+                         "CUTLASS",
+                         False,
+                         marks=pytest.mark.skip_less_mpi_world_size(8)),
+            pytest.param(8,
+                         1,
+                         8,
+                         1,
+                         False,
+                         True,
+                         True,
+                         True,
+                         24,
+                         "CUTLASS",
+                         False,
+                         marks=pytest.mark.skip_less_mpi_world_size(8)),
+            pytest.param(8,
+                         1,
+                         8,
+                         0,
+                         True,
+                         True,
+                         True,
+                         True,
+                         24,
+                         "CUTLASS",
+                         False,
+                         marks=pytest.mark.skip_less_mpi_world_size(8)),
+            pytest.param(8,
+                         1,
+                         8,
+                         3,
+                         False,
+                         False,
+                         True,
+                         True,
+                         1,
+                         "TRTLLM",
+                         False,
+                         marks=pytest.mark.skip_less_mpi_world_size(8)),
+            pytest.param(8,
+                         1,
+                         8,
+                         1,
+                         False,
+                         True,
+                         True,
+                         True,
+                         24,
+                         "CUTLASS",
+                         True,
+                         marks=pytest.mark.skip_less_mpi_world_size(8)),
+            pytest.param(4,
+                         1,
+                         4,
+                         0,
+                         False,
+                         True,
+                         True,
+                         True,
+                         24,
+                         "CUTLASS",
+                         False,
+                         marks=pytest.mark.skip_less_mpi_world_size(4)),
+            pytest.param(4,
+                         1,
+                         4,
+                         1,
+                         False,
+                         True,
+                         True,
+                         True,
+                         24,
+                         "CUTLASS",
+                         False,
+                         marks=pytest.mark.skip_less_mpi_world_size(4)),
+            pytest.param(4,
+                         1,
+                         4,
+                         0,
+                         True,
+                         True,
+                         True,
+                         True,
+                         24,
+                         "CUTLASS",
+                         False,
+                         marks=pytest.mark.skip_less_mpi_world_size(4)),
+            pytest.param(4,
+                         1,
+                         4,
+                         3,
+                         False,
+                         False,
+                         True,
+                         True,
+                         1,
+                         "TRTLLM",
+                         False,
+                         marks=pytest.mark.skip_less_mpi_world_size(4)),
+            pytest.param(4,
+                         1,
+                         4,
+                         1,
+                         False,
+                         True,
+                         True,
+                         True,
+                         24,
+                         "CUTLASS",
+                         True,
+                         marks=pytest.mark.skip_less_mpi_world_size(4)),
+            pytest.param(1,
+                         4,
+                         1,
+                         1,
+                         False,
+                         False,
+                         True,
+                         True,
+                         24,
+                         "TRTLLM",
+                         False,
+                         marks=pytest.mark.skip_less_mpi_world_size(4)),
         ],
         ids=[
             "baseline", "baseline_mtp1", "baseline_fp8kv", "latency",
-            "disable_skip_indexer", "baseline_pp4_mtp1"
+            "disable_skip_indexer", "baseline_tp4", "baseline_mtp1_tp4",
+            "baseline_fp8kv_tp4", "latency_tp4", "disable_skip_indexer_tp4",
+            "baseline_pp4_mtp1"
         ])
+    @parametrize_with_ids("v2_kv_cache", [True, False])
     def test_nvfp4_multi_gpus(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                               attention_dp, cuda_graph, overlap_scheduler,
-                              max_batch_size, moe_backend,
-                              disable_skip_indexer):
+                              max_batch_size, moe_backend, disable_skip_indexer,
+                              v2_kv_cache):
         sm_version = get_sm_version()
         if moe_backend == "TRTLLM" and sm_version in (120, 121):
             pytest.skip(f"{moe_backend} backend does not support SM 120 or 121")
 
         moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
+                                        use_kv_cache_manager_v2=v2_kv_cache)
         cuda_graph_config = CudaGraphConfig(
             enable_padding=True,
             max_batch_size=max_batch_size) if cuda_graph else None
@@ -3310,7 +3485,8 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_mpi_world_size(4)
     @skip_pre_blackwell
-    def test_nvfp4_attn_multi_gpus(self):
+    @parametrize_with_ids("v2_kv_cache", [True, False])
+    def test_nvfp4_attn_multi_gpus(self, v2_kv_cache):
         """Test with NVFP4 attention checkpoint (kv_a_proj_with_mqa quantized to NVFP4).
 
         Unlike test_nvfp4_multi_gpus which uses a checkpoint with BF16 attention,
@@ -3318,7 +3494,9 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
         are also quantized to NVFP4, while indexer.wk remains BF16 (unfused).
         """
         with LLM(f"{llm_models_root()}/DeepSeek-V3.2-NVFP4-FP4attn",
-                 tensor_parallel_size=4) as llm:
+                 tensor_parallel_size=4,
+                 kv_cache_config=KvCacheConfig(
+                     use_kv_cache_manager_v2=v2_kv_cache)) as llm:
 
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
@@ -3335,17 +3513,19 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
             (8, 1, 8, 3, False, False, True, True, 1, "TRTLLM", 0),
         ],
         ids=["baseline_fp8kv", "latency", "latency_qsplit"])
+    @parametrize_with_ids("v2_kv_cache", [True, False])
     def test_nvfp4_multi_gpus_chunked_prefill(self, tp_size, pp_size, ep_size,
                                               mtp_nextn, fp8kv, attention_dp,
                                               cuda_graph, overlap_scheduler,
                                               max_batch_size, moe_backend,
-                                              q_split_threshold):
+                                              q_split_threshold, v2_kv_cache):
         sm_version = get_sm_version()
         if moe_backend == "TRTLLM" and sm_version in (120, 121):
             pytest.skip(f"{moe_backend} backend does not support SM 120 or 121")
 
         moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
+                                        use_kv_cache_manager_v2=v2_kv_cache)
         cuda_graph_config = CudaGraphConfig(
             enable_padding=True,
             max_batch_size=max_batch_size) if cuda_graph else None
