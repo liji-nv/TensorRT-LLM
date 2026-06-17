@@ -55,6 +55,10 @@ DEFAULT_SERVER_WAITING_TIMEOUT = 2100
 # Timeout for the accuracy evaluation
 DEFAULT_ACC_EVALUATION_TIMEOUT = 1500
 DEEPSEEKV4_TEST_MAX_BATCH_SIZE = 128
+DEEPSEEKV4_FLASH_DISAGG_ENV = {
+    "NCCL_NVLS_ENABLE": "0",
+    "TORCH_SYMM_MEM_DISABLE_MULTICAST": "1",
+}
 
 
 @functools.lru_cache(maxsize=1)
@@ -2364,6 +2368,7 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
                                       ctx_server_config,
                                       gen_server_config,
                                       self.MODEL_PATH,
+                                      extra_env=DEEPSEEKV4_FLASH_DISAGG_ENV,
                                       server_waiting_timeout=3600) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, is_integration_test=True)
@@ -2417,6 +2422,7 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
                                       ctx_server_config,
                                       gen_server_config,
                                       self.MODEL_PATH,
+                                      extra_env=DEEPSEEKV4_FLASH_DISAGG_ENV,
                                       server_waiting_timeout=3600) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, is_integration_test=True)
