@@ -56,6 +56,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     ReuseScope,
     SwaScratchReuseConfig,
     TokenIdExt,
+    _cpp_introspection,
     _KVCache,
     exact_div,
     gen_multimodal_cache_key_tokens,
@@ -1243,6 +1244,13 @@ class KVCacheManagerV2(BaseResourceManager):
         }
 
     def _format_kv_cache_pool_lifecycle_entry(self, layer_id: LayerId, role: DataRole) -> str:
+        if _cpp_introspection is not None:
+            lifecycle_id = self.impl.get_layer_group_id(layer_id)
+            layer = self.kv_cache_manager_py_config.layers[int(layer_id)]
+            return (
+                f"role={str(role)}, lifecycle_id={int(lifecycle_id)}, "
+                f"sliding_window_size={layer.sliding_window_size}"
+            )
         attr = self.impl._storage.get_buffer_attr(layer_id, role)
         pool_group_id = self.impl._storage.get_pool_group_index(attr.life_cycle_id)
         lifecycle = self.impl._life_cycles.get_life_cycle(attr.life_cycle_id)
@@ -1475,9 +1483,12 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_cache_config: KvCacheConfig,
         *,
         tokens_per_block: int,
-        vocab_size: int,
+        vocab_size: int | None,
         cache_tiers: List[CacheTierConfig],
     ) -> KVCacheManagerConfigPy:
+        # Kept in the virtual method contract for cache-manager subclasses.
+        # The generic C++ config no longer stores the vocabulary size.
+        del vocab_size
         buffer_type = [Role.KEY]
         if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
             buffer_type.append(Role.VALUE)
@@ -1536,7 +1547,6 @@ class KVCacheManagerV2(BaseResourceManager):
 
         return KVCacheManagerConfigPy(
             tokens_per_block=tokens_per_block,
-            vocab_size=vocab_size,
             cache_tiers=cache_tiers,
             max_util_for_resume=kv_cache_config.max_util_for_resume,
             enable_stats=self.enable_stats,
