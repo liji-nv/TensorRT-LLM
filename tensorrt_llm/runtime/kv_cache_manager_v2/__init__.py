@@ -20,18 +20,6 @@ from pathlib import Path
 from types import ModuleType
 from typing import NamedTuple, Optional, Union
 
-from ._event_manager import (
-    KVCacheCreatedData,
-    KVCacheEvent,
-    KVCacheEventDiff,
-    KVCacheEventManager,
-    KVCacheRemovedData,
-    KVCacheStoredBlockData,
-    KVCacheStoredData,
-    KVCacheUpdatedData,
-    UniqueToken,
-)
-
 _BACKEND = os.environ.get("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp").lower()
 
 if _BACKEND == "python":
@@ -83,6 +71,17 @@ if _BACKEND == "python":
         _KVCache,
     )
     from ._core._kv_cache import _Status as KvCacheStatus  # noqa: F401
+    from ._event_manager import (  # noqa: F401
+        KVCacheCreatedData,
+        KVCacheEvent,
+        KVCacheEventDiff,
+        KVCacheEventManager,
+        KVCacheRemovedData,
+        KVCacheStoredBlockData,
+        KVCacheStoredData,
+        KVCacheUpdatedData,
+        UniqueToken,
+    )
     from ._exceptions import OutOfPagesError  # noqa: F401
     from ._life_cycle_registry import LayerGroupId, LifeCycleId  # noqa: F401
     from ._stats import (  # noqa: F401
@@ -142,10 +141,18 @@ else:
     ExpandedBuffer = _cpp.ExpandedBuffer
     HostCacheTierConfig = _cpp.HostCacheTierConfig
     KVCacheDesc = _cpp.KVCacheDesc
+    KVCacheCreatedData = _cpp.KVCacheCreatedData
+    KVCacheEvent = _cpp.KVCacheEvent
+    KVCacheEventDiff = _cpp.KVCacheEventDiff
+    KVCacheEventManager = _cpp.KVCacheEventManager
     KVCacheIterationStatsDelta = _cpp.KVCacheIterationStatsDelta
     KVCacheManager = _cpp.KVCacheManager
     KVCacheManagerConfig = _cpp.KVCacheManagerConfig
+    KVCacheRemovedData = _cpp.KVCacheRemovedData
     KVCacheStatsDelta = _cpp.KVCacheStatsDelta
+    KVCacheStoredBlockData = _cpp.KVCacheStoredBlockData
+    KVCacheStoredData = _cpp.KVCacheStoredData
+    KVCacheUpdatedData = _cpp.KVCacheUpdatedData
     KvCacheStatus = _cpp.KvCacheStatus
     OutOfPagesError = _cpp.OutOfPagesError
     PageStatus = _cpp.PageStatus
@@ -164,6 +171,7 @@ else:
     ReuseScope = getattr(_cpp, "ReuseScope", ReuseScope)
     ScratchDesc = getattr(_cpp, "ScratchDesc", None)
     SwaScratchReuseConfig = getattr(_cpp, "SwaScratchReuseConfig", None)
+    UniqueToken = _cpp.UniqueToken
 
     BeamIndex = int
     CacheLevel = int

@@ -50,6 +50,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     DiskCacheTierConfig,
     GpuCacheTierConfig,
     HostCacheTierConfig,
+    KVCacheEventManager,
     KVCacheIterationStatsDelta,
     LayerId,
     PageIndexMode,
@@ -65,7 +66,6 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManager as KVCacheManagerPy
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManagerConfig as KVCacheManagerConfigPy
-from tensorrt_llm.runtime.kv_cache_manager_v2._event_manager import KVCacheEventManager
 from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import CuError
 from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import (
     OutOfMemoryError as KVCacheOutOfMemoryError,

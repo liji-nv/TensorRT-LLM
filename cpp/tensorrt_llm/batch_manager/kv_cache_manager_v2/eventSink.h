@@ -25,9 +25,7 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 
 struct Block;
 
-// Boundary between the C++ cache implementation and an event queue. The core
-// emits state transitions; serialization, batching, and hash selection remain
-// the responsibility of the sink implementation.
+// Boundary between the cache implementation and the native event manager.
 class EventSink
 {
 public:
