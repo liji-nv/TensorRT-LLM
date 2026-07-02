@@ -101,23 +101,25 @@ std::vector<int> PageIndexConverter::operator()(int baseIndex) const
 // KvCacheManager
 // ---------------------------------------------------------------------------
 
-KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config)
+KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config, std::shared_ptr<EventSink> eventSink)
     : mConfig(config)
     , mLifeCycles(config)
+    , mEventSink(std::move(eventSink))
     , mAvgReusedLength(0.9999)
     , mAvgSqrCapacity(0.9999)
     , mAvgSqrHistoryLength(0.9999)
 {
     mConfig.validate();
 
-    mRadixTree = std::make_shared<BlockRadixTree>(mLifeCycles, mConfig.tokensPerBlock);
+    mRadixTree = std::make_shared<BlockRadixTree>(mLifeCycles, mConfig.tokensPerBlock, mEventSink);
 
     StorageConfig storageConfig = createStorageConfig(mConfig);
     mStorage = std::make_shared<StorageManager>(mLifeCycles, storageConfig, mConfig.tokensPerBlock,
-        mConfig.swaScratchReuse, mConfig.typicalStep, mConfig.constraints);
+        mConfig.swaScratchReuse, mConfig.typicalStep, mConfig.constraints, mConfig.initialPoolRatio, mEventSink);
 
     mTargetRatioListGpu = _currentGpuRatio();
     mTargetRatioListOther = _currentOtherRatios();
+    _resetIterationPeakNumBlocks();
 
     mLastAdjustmentTime = nowSeconds();
 }
@@ -152,12 +154,21 @@ void KvCacheManager::clearReusableBlocks()
 }
 
 std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope,
-    std::vector<TokenIdExt> const& inputTokens, std::optional<int64_t> id, KvCache::PriorityCb priorityCb)
+    std::vector<TokenIdExt> const& inputTokens, std::optional<int64_t> id, KvCache::PriorityCb priorityCb,
+    std::optional<int> expectedPromptLength)
 {
     if (!priorityCb)
+    {
         priorityCb = [](BlockOrdinal, LifeCycleId) { return kPriorityDefault; };
+    }
 
-    return std::make_shared<KvCache>(*this, std::move(reuseScope), inputTokens, std::move(id), std::move(priorityCb));
+    if (!expectedPromptLength.has_value() && !inputTokens.empty())
+    {
+        expectedPromptLength = static_cast<int>(inputTokens.size());
+    }
+
+    return std::make_shared<KvCache>(
+        *this, std::move(reuseScope), inputTokens, std::move(id), std::move(priorityCb), expectedPromptLength);
 }
 
 BlockRadixTree::ReuseMatch KvCacheManager::matchReuse(
@@ -399,6 +410,147 @@ size_t KvCacheManager::getQuota(CacheLevel level) const
     return mStorage->mLevels.at(level).storage->totalQuota();
 }
 
+// ---- Statistics ----------------------------------------------------------
+
+void KvCacheManager::commitStats(
+    KVCacheStatsDelta const& stats, IterationStatsByLifeCycle const& iterationStatsByLifeCycle)
+{
+    if (!mConfig.enableStats)
+    {
+        return;
+    }
+
+    _updateIterationPeakNumBlocks();
+    mCommittedStats.add(stats);
+    for (auto const& [lifeCycle, iterationStats] : iterationStatsByLifeCycle)
+    {
+        if (!iterationStats.empty())
+        {
+            mIterationStatsByLifeCycle[lifeCycle].add(iterationStats);
+        }
+    }
+}
+
+KVCacheStatsDelta KvCacheManager::getCommittedStats() const
+{
+    return mCommittedStats.copy();
+}
+
+IterationStatsByLifeCycle KvCacheManager::getAndResetIterationStats()
+{
+    IterationStatsByLifeCycle stats;
+    for (auto const& [lifeCycle, delta] : mIterationStatsByLifeCycle)
+    {
+        if (!delta.empty())
+        {
+            stats.emplace(lifeCycle, delta.copy());
+        }
+    }
+    mIterationStatsByLifeCycle.clear();
+    return stats;
+}
+
+PeakBlockStatsByCacheLevel KvCacheManager::_currentBlockStatsByCacheLevel() const
+{
+    PeakBlockStatsByCacheLevel result(mStorage->numCacheLevels());
+    for (CacheLevel cacheLevel{0}; cacheLevel < mStorage->numCacheLevels(); ++cacheLevel)
+    {
+        auto& levelStats = result[cacheLevel];
+        levelStats.resize(mStorage->numPoolGroups());
+        for (PoolGroupIndex poolGroup{0}; poolGroup < mStorage->numPoolGroups(); ++poolGroup)
+        {
+            auto const stats = mStorage->getStatistics(cacheLevel, poolGroup);
+            levelStats[poolGroup] = {stats.available(), stats.unavailable(), stats.evictable};
+        }
+    }
+    return result;
+}
+
+void KvCacheManager::_resetIterationPeakNumBlocks(std::optional<CacheLevel> cacheLevel)
+{
+    if (!cacheLevel.has_value())
+    {
+        mIterationPeakNumBlocksByCacheLevel = _currentBlockStatsByCacheLevel();
+        return;
+    }
+
+    PeakBlockStatsByPoolGroup levelStats(mStorage->numPoolGroups());
+    for (PoolGroupIndex poolGroup{0}; poolGroup < mStorage->numPoolGroups(); ++poolGroup)
+    {
+        auto const stats = mStorage->getStatistics(*cacheLevel, poolGroup);
+        levelStats[poolGroup] = {stats.available(), stats.unavailable(), stats.evictable};
+    }
+    mIterationPeakNumBlocksByCacheLevel[*cacheLevel] = std::move(levelStats);
+}
+
+void KvCacheManager::_updateIterationPeakNumBlocks()
+{
+    auto const current = _currentBlockStatsByCacheLevel();
+    for (CacheLevel cacheLevel{0}; cacheLevel < current.size(); ++cacheLevel)
+    {
+        auto& peakLevel = mIterationPeakNumBlocksByCacheLevel[cacheLevel];
+        for (PoolGroupIndex poolGroup{0}; poolGroup < current[cacheLevel].size(); ++poolGroup)
+        {
+            auto& peak = peakLevel[poolGroup];
+            auto const& value = current[cacheLevel][poolGroup];
+            peak.available = std::max(peak.available, value.available);
+            peak.unavailable = std::max(peak.unavailable, value.unavailable);
+            peak.evictable = std::max(peak.evictable, value.evictable);
+        }
+    }
+}
+
+PeakBlockStatsByPoolGroup KvCacheManager::getAndResetIterationPeakBlockStats(CacheLevel cacheLevel)
+{
+    _updateIterationPeakNumBlocks();
+    PeakBlockStatsByPoolGroup peak = mIterationPeakNumBlocksByCacheLevel.at(cacheLevel);
+    _resetIterationPeakNumBlocks(cacheLevel);
+    return peak;
+}
+
+void KvCacheManager::markStatsDirty(std::optional<int64_t> kvCacheId)
+{
+    if (kvCacheId.has_value())
+    {
+        mDirtyStatsKvCacheIds.insert(*kvCacheId);
+    }
+}
+
+void KvCacheManager::clearStatsDirty(std::optional<int64_t> kvCacheId)
+{
+    if (kvCacheId.has_value())
+    {
+        mDirtyStatsKvCacheIds.erase(*kvCacheId);
+    }
+}
+
+std::unordered_set<int64_t> KvCacheManager::getDirtyStatsKvCacheIds() const
+{
+    return mDirtyStatsKvCacheIds;
+}
+
+void KvCacheManager::markStatsExcluded(std::optional<int64_t> kvCacheId)
+{
+    if (kvCacheId.has_value())
+    {
+        mStatsExcludedKvCacheIds.insert(*kvCacheId);
+        clearStatsDirty(kvCacheId);
+    }
+}
+
+void KvCacheManager::clearStatsExcluded(std::optional<int64_t> kvCacheId)
+{
+    if (kvCacheId.has_value())
+    {
+        mStatsExcludedKvCacheIds.erase(*kvCacheId);
+    }
+}
+
+bool KvCacheManager::isStatsExcluded(std::optional<int64_t> kvCacheId) const
+{
+    return kvCacheId.has_value() && mStatsExcludedKvCacheIds.find(*kvCacheId) != mStatsExcludedKvCacheIds.end();
+}
+
 TypedVec<CacheLevel, CacheTier> KvCacheManager::cacheTierList() const
 {
     TypedVec<CacheLevel, CacheTier> result;
@@ -455,8 +607,11 @@ int KvCacheManager::clampMaxSeqLenForMem(int batchSize, int tokenNumUpperBound) 
     {
         TLLM_CHECK_DEBUG(minSlots[pgIdx] >= 0);
         SlotCount const reservedSlots = minSlots[pgIdx] * (batchSize - 1);
-        TLLM_CHECK_DEBUG(remainingSlots[pgIdx] >= reservedSlots);
         remainingSlots[pgIdx] -= reservedSlots;
+        if (remainingSlots[pgIdx] < 0)
+        {
+            return 0;
+        }
     }
 
     auto isEnough = [&](int numBlocks) -> bool
@@ -473,7 +628,10 @@ int KvCacheManager::clampMaxSeqLenForMem(int batchSize, int tokenNumUpperBound) 
         return true;
     };
 
-    TLLM_CHECK_DEBUG(isEnough(1));
+    if (!isEnough(1))
+    {
+        return 0;
+    }
     int lb = 1;
     int ub = divUp(tokenNumUpperBound, tokPerBlock);
     if (isEnough(ub))

@@ -20,14 +20,18 @@
 #include "kv_cache_manager_v2/blockRadixTree.h"
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/config.h"
+#include "kv_cache_manager_v2/eventSink.h"
 #include "kv_cache_manager_v2/exceptions.h"
 #include "kv_cache_manager_v2/introspection.h"
 #include "kv_cache_manager_v2/kvCache.h"
 #include "kv_cache_manager_v2/kvCacheManager.h"
 #include "kv_cache_manager_v2/lifeCycleRegistry.h"
+#include "kv_cache_manager_v2/page.h"
+#include "kv_cache_manager_v2/stats.h"
 #include "kv_cache_manager_v2/storage/config.h"
 #include "kv_cache_manager_v2/storage/core.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cstring>
 #include <memory>
@@ -43,6 +47,8 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace nb = nanobind;
@@ -150,10 +156,10 @@ static nb::tuple reuseScopeTuple(kv::ReuseScope const& self)
     return nb::make_tuple(optionalIntToObject(self.loraId), optionalIntToObject(self.salt));
 }
 
-static nb::list committedTokensList(kv::KvCache const& self)
+static nb::list tokenList(std::vector<kv::TokenIdExt> const& tokens)
 {
     nb::list result;
-    for (auto const& tok : self.committedTokens())
+    for (auto const& tok : tokens)
     {
         if (auto* id = std::get_if<kv::TokenId>(&tok))
         {
@@ -164,6 +170,288 @@ static nb::list committedTokensList(kv::KvCache const& self)
             auto const& d = std::get<kv::DigestToken>(tok);
             result.append(nb::bytes(reinterpret_cast<char const*>(d.data()), d.size()));
         }
+    }
+    return result;
+}
+
+static nb::list committedTokensList(kv::KvCache const& self)
+{
+    return tokenList(self.committedTokens());
+}
+
+static nb::bytes digestBytes(kv::Digest const& digest)
+{
+    return nb::bytes(reinterpret_cast<char const*>(digest.data()), digest.size());
+}
+
+using EventKeyMap = std::unordered_map<kv::Digest, nb::object>;
+
+static nb::object getOrCreateEventKey(kv::Block const& block, EventKeyMap& eventKeys)
+{
+    if (auto const iter = eventKeys.find(block.key); iter != eventKeys.end())
+    {
+        return iter->second;
+    }
+
+    std::vector<kv::Block const*> missingBlocks;
+    kv::NodeBase const* current = &block;
+    nb::object eventKey;
+    while (current->type() == kv::NodeBase::Type::kBLOCK)
+    {
+        auto const* currentBlock = static_cast<kv::Block const*>(current);
+        if (auto const iter = eventKeys.find(currentBlock->key); iter != eventKeys.end())
+        {
+            eventKey = iter->second;
+            break;
+        }
+        missingBlocks.push_back(currentBlock);
+        current = currentBlock->prev;
+        if (current == nullptr)
+        {
+            throw std::logic_error("Cannot hash an orphan KV cache block");
+        }
+    }
+
+    nb::object hasherClass
+        = nb::module_::import_("tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree").attr("Hasher");
+    if (!eventKey)
+    {
+        auto const* root = static_cast<kv::RootBlock const*>(current);
+        auto reuseScopeBytes = root->reuseScope.toBytes();
+        eventKey = hasherClass(nb::bytes(reinterpret_cast<char const*>(reuseScopeBytes.data()), reuseScopeBytes.size()))
+                       .attr("digest");
+    }
+
+    for (auto iter = missingBlocks.rbegin(); iter != missingBlocks.rend(); ++iter)
+    {
+        kv::Block const* missingBlock = *iter;
+        eventKey = hasherClass(eventKey).attr("update")(tokenList(missingBlock->tokens)).attr("digest");
+        eventKeys.emplace(missingBlock->key, eventKey);
+    }
+    return eventKey;
+}
+
+static bool hasCachedV1Hash(nb::handle eventManager, kv::Digest const& blockKey)
+{
+    nb::object cache = eventManager.attr("_v1_hash_by_block_key");
+    return nb::cast<bool>(cache.attr("__contains__")(digestBytes(blockKey)));
+}
+
+static nb::object makeEventBlockSnapshot(
+    kv::Block const& block, nb::handle eventManager, bool useV1Hash, EventKeyMap& eventKeys)
+{
+    getOrCreateEventKey(block, eventKeys);
+
+    std::vector<kv::Block const*> chain{&block};
+    kv::NodeBase const* current = block.prev;
+    if (current == nullptr)
+    {
+        throw std::logic_error("Cannot snapshot an orphan KV cache block");
+    }
+    while (current->type() == kv::NodeBase::Type::kBLOCK)
+    {
+        auto const* currentBlock = static_cast<kv::Block const*>(current);
+        chain.push_back(currentBlock);
+        if (!useV1Hash || hasCachedV1Hash(eventManager, currentBlock->key))
+        {
+            current = nullptr;
+            break;
+        }
+        current = currentBlock->prev;
+        if (current == nullptr)
+        {
+            throw std::logic_error("Cannot snapshot an orphan KV cache block");
+        }
+    }
+
+    nb::object simpleNamespace = nb::module_::import_("types").attr("SimpleNamespace");
+    nb::object previous = simpleNamespace();
+    previous.attr("ordinal") = -1;
+    previous.attr("reuse_scope")
+        = current ? nb::cast(static_cast<kv::RootBlock const*>(current)->reuseScope) : nb::cast(kv::ReuseScope{});
+
+    std::reverse(chain.begin(), chain.end());
+    for (kv::Block const* chainBlock : chain)
+    {
+        nb::object snapshot = simpleNamespace();
+        nb::list tokens = tokenList(chainBlock->tokens);
+        snapshot.attr("key") = digestBytes(chainBlock->key);
+        snapshot.attr("event_key") = getOrCreateEventKey(*chainBlock, eventKeys);
+        snapshot.attr("tokens") = std::move(tokens);
+        snapshot.attr("prev") = previous;
+        snapshot.attr("ordinal") = chainBlock->ordinal().value();
+
+        nb::list storage;
+        if (chainBlock == &block)
+        {
+            for (kv::CommittedPage const* page : chainBlock->storage)
+            {
+                if (page == nullptr)
+                {
+                    storage.append(nb::none());
+                    continue;
+                }
+                nb::object pageSnapshot = simpleNamespace();
+                pageSnapshot.attr("cache_level") = page->cacheLevel.value();
+                pageSnapshot.attr("priority") = page->priority;
+                storage.append(std::move(pageSnapshot));
+            }
+        }
+        snapshot.attr("storage") = std::move(storage);
+        previous = std::move(snapshot);
+    }
+    return previous;
+}
+
+class PythonEventSink final : public kv::EventSink
+{
+public:
+    explicit PythonEventSink(nb::handle eventManager)
+        : mEventManager(eventManager.ptr())
+        , mUseV1Hash(nb::cast<std::string>(eventManager.attr("_hash_algo")) == "v1_block_key")
+    {
+        Py_INCREF(mEventManager);
+    }
+
+    ~PythonEventSink() override
+    {
+        if (Py_IsInitialized())
+        {
+            nb::gil_scoped_acquire acquire;
+            mEventKeys.clear();
+            Py_DECREF(mEventManager);
+        }
+    }
+
+    PythonEventSink(PythonEventSink const&) = delete;
+    PythonEventSink& operator=(PythonEventSink const&) = delete;
+
+    nb::object eventManager() const
+    {
+        return nb::borrow<nb::object>(mEventManager);
+    }
+
+    void addStoredBlock(kv::Block const& block) noexcept override
+    {
+        invoke(
+            [&]
+            {
+                nb::object manager = eventManager();
+                manager.attr("add_stored_block_event_from_block")(
+                    makeEventBlockSnapshot(block, manager, mUseV1Hash, mEventKeys));
+            });
+    }
+
+    void addStoredLifeCycle(kv::Block const& block, kv::LifeCycleId lifeCycle) noexcept override
+    {
+        invoke(
+            [&]
+            {
+                nb::object manager = eventManager();
+                manager.attr("add_stored_life_cycle_event_from_block")(
+                    makeEventBlockSnapshot(block, manager, mUseV1Hash, mEventKeys), lifeCycle.value());
+            });
+    }
+
+    void addRemovedBlock(kv::Digest const& blockKey) noexcept override
+    {
+        invoke(
+            [&]
+            {
+                eventManager().attr("add_removed_event")(digestBytes(blockKey));
+                mEventKeys.erase(blockKey);
+            });
+    }
+
+    void addRemovedLifeCycle(kv::Digest const& blockKey, kv::LifeCycleId lifeCycle) noexcept override
+    {
+        invoke([&] { eventManager().attr("add_removed_life_cycle_event")(digestBytes(blockKey), lifeCycle.value()); });
+    }
+
+    void addCacheLevelUpdated(kv::Digest const& blockKey, kv::CacheLevel oldLevel, kv::CacheLevel newLevel,
+        kv::LifeCycleId lifeCycle) noexcept override
+    {
+        invoke(
+            [&]
+            {
+                nb::object diffClass = nb::module_::import_("tensorrt_llm.runtime.kv_cache_manager_v2._event_manager")
+                                           .attr("KVCacheEventDiff");
+                nb::dict kwargs;
+                kwargs["cache_level"] = diffClass(oldLevel.value(), newLevel.value());
+                kwargs["layer_group_id"] = lifeCycle.value();
+                eventManager().attr("add_updated_event")(digestBytes(blockKey), **kwargs);
+            });
+    }
+
+private:
+    template <typename Callable>
+    void invoke(Callable&& callable) noexcept
+    {
+        nb::gil_scoped_acquire acquire;
+        try
+        {
+            std::forward<Callable>(callable)();
+        }
+        catch (nb::python_error& error)
+        {
+            error.restore();
+            PyErr_WriteUnraisable(mEventManager);
+        }
+        catch (std::exception const& error)
+        {
+            PyErr_SetString(PyExc_RuntimeError, error.what());
+            PyErr_WriteUnraisable(mEventManager);
+        }
+    }
+
+    PyObject* mEventManager;
+    bool mUseV1Hash;
+    EventKeyMap mEventKeys;
+};
+
+static nb::object castStatsDelta(kv::KVCacheStatsDelta const& stats)
+{
+    nb::object cls = nb::module_::import_("tensorrt_llm.runtime.kv_cache_manager_v2._stats").attr("KVCacheStatsDelta");
+    return cls(stats.allocTotalBlocks, stats.allocNewBlocks, stats.reusedBlocks, stats.missedBlocks);
+}
+
+static nb::object castIterationStatsDelta(kv::KVCacheIterationStatsDelta const& stats)
+{
+    nb::object cls
+        = nb::module_::import_("tensorrt_llm.runtime.kv_cache_manager_v2._stats").attr("KVCacheIterationStatsDelta");
+    return cls(stats.iterAllocTotalBlocks, stats.iterAllocNewBlocks, stats.iterReusedBlocks, stats.iterFullReusedBlocks,
+        stats.iterPartialReusedBlocks, stats.iterMissedBlocks, stats.iterGenAllocBlocks, stats.iterOnboardBlocks,
+        stats.iterOnboardBytes, stats.iterOffloadBlocks, stats.iterOffloadBytes, stats.iterIntraDeviceCopyBlocks,
+        stats.iterIntraDeviceCopyBytes, stats.iterHostDroppedBlocks, stats.iterHostDroppedBytes);
+}
+
+static nb::dict castIterationStatsByLifeCycle(kv::IterationStatsByLifeCycle const& statsByLifeCycle)
+{
+    nb::dict result;
+    for (auto const& [lifeCycle, stats] : statsByLifeCycle)
+    {
+        result[nb::int_(lifeCycle.value())] = castIterationStatsDelta(stats);
+    }
+    return result;
+}
+
+static nb::list castPeakBlockStats(kv::PeakBlockStatsByPoolGroup const& statsByPoolGroup)
+{
+    nb::object cls = nb::module_::import_("tensorrt_llm.runtime.kv_cache_manager_v2").attr("PoolGroupPeakBlockStats");
+    nb::list result;
+    for (auto const& stats : statsByPoolGroup)
+    {
+        result.append(cls(stats.available, stats.unavailable, stats.evictable));
+    }
+    return result;
+}
+
+static nb::object castRequestIds(std::unordered_set<int64_t> const& requestIds)
+{
+    nb::object result = nb::module_::import_("builtins").attr("set")();
+    for (int64_t const requestId : requestIds)
+    {
+        result.attr("add")(requestId);
     }
     return result;
 }
@@ -542,8 +830,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "__init__",
             [](kv::KVCacheManagerConfig* cfg, int tokensPerBlock, std::vector<kv::CacheTierConfig> cacheTiers,
                 nb::list layers, float maxUtilForResume, bool enablePartialReuse,
-                std::optional<kv::BatchDesc> typicalStep, std::vector<kv::BatchDesc> constraints, int ssmReuseInterval,
-                std::optional<kv::SwaScratchReuseConfig> swaScratchReuse, std::optional<kv::HelixConfig> helixConfig)
+                std::optional<kv::BatchDesc> typicalStep, std::vector<kv::BatchDesc> constraints,
+                std::optional<std::vector<float>> initialPoolRatio, int ssmReuseInterval,
+                std::optional<kv::SwaScratchReuseConfig> swaScratchReuse, bool enableStats,
+                std::optional<kv::HelixConfig> helixConfig)
             {
                 new (cfg) kv::KVCacheManagerConfig();
                 cfg->tokensPerBlock = tokensPerBlock;
@@ -560,14 +850,17 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 cfg->enablePartialReuse = enablePartialReuse;
                 cfg->typicalStep = std::move(typicalStep);
                 cfg->constraints = std::move(constraints);
+                cfg->initialPoolRatio = std::move(initialPoolRatio);
                 cfg->ssmReuseInterval = ssmReuseInterval;
                 cfg->swaScratchReuse = std::move(swaScratchReuse);
+                cfg->enableStats = enableStats;
                 cfg->helixConfig = std::move(helixConfig);
             },
             nb::arg("tokens_per_block"), nb::arg("cache_tiers"), nb::arg("layers"),
             nb::arg("max_util_for_resume") = 0.97f, nb::arg("enable_partial_reuse") = true,
             nb::arg("typical_step") = std::nullopt, nb::arg("constraints") = std::vector<kv::BatchDesc>{},
-            nb::arg("ssm_reuse_interval") = 512, nb::arg("swa_scratch_reuse").none() = std::nullopt,
+            nb::arg("initial_pool_ratio").none() = std::nullopt, nb::arg("ssm_reuse_interval") = 512,
+            nb::arg("swa_scratch_reuse").none() = std::nullopt, nb::arg("enable_stats") = true,
             nb::arg("helix_config").none() = std::nullopt)
         .def_rw("tokens_per_block", &kv::KVCacheManagerConfig::tokensPerBlock)
         .def_rw("cache_tiers", &kv::KVCacheManagerConfig::cacheTiers)
@@ -576,8 +869,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("enable_partial_reuse", &kv::KVCacheManagerConfig::enablePartialReuse)
         .def_rw("typical_step", &kv::KVCacheManagerConfig::typicalStep)
         .def_rw("constraints", &kv::KVCacheManagerConfig::constraints)
+        .def_rw("initial_pool_ratio", &kv::KVCacheManagerConfig::initialPoolRatio)
         .def_rw("ssm_reuse_interval", &kv::KVCacheManagerConfig::ssmReuseInterval)
         .def_rw("swa_scratch_reuse", &kv::KVCacheManagerConfig::swaScratchReuse)
+        .def_rw("enable_stats", &kv::KVCacheManagerConfig::enableStats)
         .def_prop_ro("enable_swa_scratch_reuse", &kv::KVCacheManagerConfig::enableSwaScratchReuse)
         .def_prop_rw(
             "helix_config",
@@ -621,6 +916,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "prefetch", [](kv::KvCache& self, int target) { return self.prefetch(kv::CacheLevel{target}); },
             nb::arg("target"), nb::call_guard<nb::gil_scoped_release>())
         .def("close", &kv::KvCache::close, nb::call_guard<nb::gil_scoped_release>())
+        .def("commit_pending_stats", [](kv::KvCache& self) { return castStatsDelta(self.commitPendingStats()); })
+        .def("discard_pending_stats", &kv::KvCache::discardPendingStats)
         .def(
             "resize",
             [](kv::KvCache& self, std::optional<int> capacity, std::optional<int> historyLength) -> bool
@@ -814,6 +1111,19 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         },
         nb::arg("manager"), nb::arg("cache_level") = kv::kGpuLevel.value(), nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def(
+        "life_cycle_pool_group_indices",
+        [](kv::KvCacheManager& manager)
+        {
+            std::vector<int> result;
+            result.reserve(manager.lifeCycles().size().value());
+            for (kv::LifeCycleId lifeCycle{0}; lifeCycle < manager.lifeCycles().size(); ++lifeCycle)
+            {
+                result.push_back(manager.storage().getPoolGroupIndex(lifeCycle).value());
+            }
+            return result;
+        },
+        nb::arg("manager"), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
         "storage_utilization",
         [](kv::KvCacheManager& manager, int cacheLevel)
         {
@@ -863,27 +1173,45 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
 
     // ---- KvCacheManager ----------------------------------------------------
     nb::class_<kv::KvCacheManager>(m, "KVCacheManager")
-        .def(nb::init<kv::KVCacheManagerConfig const&>(), nb::arg("config"), nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "__init__",
+            [](kv::KvCacheManager* self, kv::KVCacheManagerConfig const& config, nb::object eventManager)
+            {
+                std::shared_ptr<kv::EventSink> eventSink;
+                if (!eventManager.is_none())
+                {
+                    eventSink = std::make_shared<PythonEventSink>(eventManager);
+                }
+                nb::gil_scoped_release release;
+                new (self) kv::KvCacheManager(config, std::move(eventSink));
+            },
+            nb::arg("config"), nb::arg("event_manager").none() = nb::none())
         .def("shutdown", &kv::KvCacheManager::shutdown, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "clear_reusable_blocks", &kv::KvCacheManager::clearReusableBlocks, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "create_kv_cache",
             [](std::shared_ptr<kv::KvCacheManager> self, nb::object reuseScopeObj, nb::object inputTokens,
-                std::optional<int64_t> id, nb::object customPriorityCallback)
+                std::optional<int64_t> id, nb::object customPriorityCallback, std::optional<int> expectedPromptLength)
             {
                 kv::ReuseScope reuseScope = castReuseScope(std::move(reuseScopeObj));
                 std::vector<kv::TokenIdExt> tokens;
+                bool const hasInputTokens = !inputTokens.is_none();
                 if (!inputTokens.is_none())
                 {
                     tokens = castTokenIterable(inputTokens);
                 }
+                if (!expectedPromptLength.has_value() && hasInputTokens)
+                {
+                    expectedPromptLength = static_cast<int>(tokens.size());
+                }
                 kv::KvCache::PriorityCb priorityCb = castPriorityCallback(*self, std::move(customPriorityCallback));
                 nb::gil_scoped_release release;
-                return self->createKvCache(std::move(reuseScope), tokens, id, std::move(priorityCb));
+                return self->createKvCache(
+                    std::move(reuseScope), tokens, id, std::move(priorityCb), expectedPromptLength);
             },
             nb::arg("reuse_scope") = nb::none(), nb::arg("input_tokens") = nb::none(), nb::arg("id") = std::nullopt,
-            nb::arg("custom_priority_callback") = nb::none())
+            nb::arg("custom_priority_callback") = nb::none(), nb::arg("expected_prompt_length") = std::nullopt)
         .def(
             "probe_reuse",
             [](std::shared_ptr<kv::KvCacheManager> self, nb::object reuseScopeObj, nb::object inputTokens)
@@ -914,7 +1242,29 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "get_quota",
             [](kv::KvCacheManager const& self, int cacheLevel) { return self.getQuota(kv::CacheLevel{cacheLevel}); },
             nb::arg("cache_level"))
+        .def("get_committed_stats",
+            [](kv::KvCacheManager const& self) { return castStatsDelta(self.getCommittedStats()); })
+        .def("get_and_reset_iteration_stats",
+            [](kv::KvCacheManager& self) { return castIterationStatsByLifeCycle(self.getAndResetIterationStats()); })
+        .def(
+            "get_and_reset_iteration_peak_block_stats",
+            [](kv::KvCacheManager& self, int cacheLevel)
+            { return castPeakBlockStats(self.getAndResetIterationPeakBlockStats(kv::CacheLevel{cacheLevel})); },
+            nb::arg("cache_level"))
+        .def("mark_stats_dirty", &kv::KvCacheManager::markStatsDirty, nb::arg("kv_cache_id").none())
+        .def("clear_stats_dirty", &kv::KvCacheManager::clearStatsDirty, nb::arg("kv_cache_id").none())
+        .def("get_dirty_stats_kv_cache_ids",
+            [](kv::KvCacheManager const& self) { return castRequestIds(self.getDirtyStatsKvCacheIds()); })
+        .def("mark_stats_excluded", &kv::KvCacheManager::markStatsExcluded, nb::arg("kv_cache_id").none())
+        .def("clear_stats_excluded", &kv::KvCacheManager::clearStatsExcluded, nb::arg("kv_cache_id").none())
+        .def("is_stats_excluded", &kv::KvCacheManager::isStatsExcluded, nb::arg("kv_cache_id").none())
         .def_prop_ro("tokens_per_block", &kv::KvCacheManager::tokensPerBlock)
+        .def_prop_ro("event_manager",
+            [](kv::KvCacheManager const& self) -> nb::object
+            {
+                auto eventSink = std::dynamic_pointer_cast<PythonEventSink>(self.eventSink());
+                return eventSink ? eventSink->eventManager() : nb::none();
+            })
         .def_prop_ro("init_config", [](kv::KvCacheManager const& self) { return self.config(); })
         .def_prop_ro("cache_tier_list", [](kv::KvCacheManager const& self) { return self.cacheTierList().raw(); })
         .def_prop_ro("all_buffer_ids", &kv::KvCacheManager::allBufferIds)

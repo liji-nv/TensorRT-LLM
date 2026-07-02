@@ -65,8 +65,6 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
     )
     from kv_cache_manager_v2._copy_engine import CopyTask, batched_copy
     from kv_cache_manager_v2._exceptions import OutOfPagesError
-    from kv_cache_manager_v2._life_cycle_registry import LifeCycleRegistry
-    from kv_cache_manager_v2._storage._config import create_storage_config
     from kv_cache_manager_v2._storage._core import CacheLevelStorage, PoolGroupBase, SlotAllocator
     from kv_cache_manager_v2._storage_manager import StorageManager
     from kv_cache_manager_v2._utils import (
@@ -119,8 +117,6 @@ else:
     )
     from tensorrt_llm.runtime.kv_cache_manager_v2._copy_engine import CopyTask, batched_copy
     from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import OutOfPagesError
-    from tensorrt_llm.runtime.kv_cache_manager_v2._life_cycle_registry import LifeCycleRegistry
-    from tensorrt_llm.runtime.kv_cache_manager_v2._storage._config import create_storage_config
     from tensorrt_llm.runtime.kv_cache_manager_v2._storage._core import (
         CacheLevelStorage,
         PoolGroupBase,
@@ -2021,6 +2017,86 @@ class TestSSMSupport(unittest.TestCase):
             KVCacheManager(cfg)
 
 
+class TestClampMaxSeqLenForMem(unittest.TestCase):
+    TOKENS_PER_BLOCK = 32
+    SLOT_SIZE = 2 << 20
+
+    def setUp(self) -> None:
+        init_cuda_once()
+        gc.collect()
+        gc.disable()
+        self.managers: list[KVCacheManager] = []
+
+    def tearDown(self) -> None:
+        for manager in self.managers:
+            manager.shutdown()
+        gc.enable()
+
+    def _make_manager(self, sliding_window_sizes: list[int | None]) -> KVCacheManager:
+        layers = [
+            AttentionLayerConfig(
+                layer_id=LayerId(layer_id),
+                buffers=[BufferConfig(role=Role.KEY, size=self.SLOT_SIZE)],
+                sliding_window_size=window_size,
+                num_sink_tokens=0 if window_size is not None else None,
+            )
+            for layer_id, window_size in enumerate(sliding_window_sizes)
+        ]
+        manager = KVCacheManager(
+            KVCacheManagerConfig(
+                tokens_per_block=self.TOKENS_PER_BLOCK,
+                cache_tiers=[GpuCacheTierConfig(quota=len(sliding_window_sizes) * self.SLOT_SIZE)],
+                layers=layers,
+            )
+        )
+        self.managers.append(manager)
+        return manager
+
+    def test_clamp_max_seq_len_for_mem_zero_upper_bound(self):
+        manager = self._make_manager([None])
+
+        self.assertEqual(
+            manager.clamp_max_seq_len_for_mem(batch_size=1, token_num_upper_bound=0), 0
+        )
+
+    def test_clamp_max_seq_len_for_mem_single_feasible_block(self):
+        manager = self._make_manager([None])
+
+        self.assertEqual(
+            manager.clamp_max_seq_len_for_mem(batch_size=1, token_num_upper_bound=32), 32
+        )
+        self.assertEqual(
+            manager.clamp_max_seq_len_for_mem(batch_size=1, token_num_upper_bound=64), 32
+        )
+
+    def test_clamp_max_seq_len_for_mem_batch_consumes_remaining_slots(self):
+        manager = self._make_manager([None])
+
+        self.assertEqual(
+            manager.clamp_max_seq_len_for_mem(batch_size=2, token_num_upper_bound=64), 0
+        )
+        self.assertEqual(
+            manager.clamp_max_seq_len_for_mem(batch_size=3, token_num_upper_bound=64), 0
+        )
+
+    def test_clamp_max_seq_len_for_mem_sliding_window_reuses_slot(self):
+        manager = self._make_manager([self.TOKENS_PER_BLOCK])
+
+        self.assertEqual(
+            manager.clamp_max_seq_len_for_mem(batch_size=1, token_num_upper_bound=96), 96
+        )
+
+    def test_clamp_max_seq_len_for_mem_multiple_pool_groups(self):
+        manager = self._make_manager([self.TOKENS_PER_BLOCK, None])
+
+        self.assertEqual(
+            manager.clamp_max_seq_len_for_mem(batch_size=1, token_num_upper_bound=96), 32
+        )
+        self.assertEqual(
+            manager.clamp_max_seq_len_for_mem(batch_size=2, token_num_upper_bound=96), 0
+        )
+
+
 class TestInitRatioConfig(unittest.TestCase):
     """Tests for init_ratio computation from typical_step and constraints."""
 
@@ -2157,27 +2233,26 @@ class TestInitRatioConfig(unittest.TestCase):
             initial_pool_ratio=[0.8, 0.2],
         )
         manager = KVCacheManager(cfg)
-        ratio = manager._current_gpu_ratio
+        ratio = _introspection.current_gpu_ratio(manager)
 
         self.assertGreater(ratio[0], ratio[1])
         self.assertAlmostEqual(sum(ratio), 1.0, places=6)
         manager.shutdown()
 
-    def test_initial_pool_ratio_length_must_match_pool_groups(self):
-        cfg = self._make_config(initial_pool_ratio=[1.0])
-        life_cycles = LifeCycleRegistry(cfg)
-        storage_config = create_storage_config(cfg)
+    @parameterized.expand(
+        [
+            ("empty", [], "initial_pool_ratio length"),
+            ("wrong_length", [1.0], "initial_pool_ratio length"),
+            ("zero", [0.0, 1.0], "initial_pool_ratio values must be positive"),
+            ("negative", [-0.1, 1.1], "initial_pool_ratio values must be positive"),
+            ("wrong_sum", [0.4, 0.5], "initial_pool_ratio values must sum to 1.0"),
+        ]
+    )
+    def test_invalid_initial_pool_ratio(self, _name: str, ratio: list[float], error: str):
+        cfg = self._make_config(initial_pool_ratio=ratio)
 
-        with self.assertRaisesRegex(ValueError, "initial_pool_ratio length"):
-            StorageManager(
-                life_cycles,
-                storage_config,
-                cfg.tokens_per_block,
-                cfg.swa_scratch_reuse,
-                typical_batch=cfg.typical_step,
-                constraints=cfg.constraints,
-                initial_pool_ratio=cfg.initial_pool_ratio,
-            )
+        with self.assertRaisesRegex(ValueError, error):
+            KVCacheManager(cfg)
 
     def test_ratio_slot_count_rounding_matches_python(self):
         grain = 2 << 20
@@ -2569,6 +2644,57 @@ class TestScratchReuse(TestKVCacheManagerV2):
         )
         self.engine = FakeEngine(self.cfg)
         self.manager = KVCacheManager(self.cfg)
+
+    def test_excess_scratch_slot_waits_for_ready_event_on_new_stream(self):
+        num_layers = 512
+        self._prepare_scratch(
+            num_layers=num_layers,
+            window_size=32,
+            tokens_per_block=32,
+            gpu_quota=16 << 20,
+        )
+        producer_prompt = [self.next_token() for _ in range(64)]
+        consumer_prompt = [self.next_token() for _ in range(256)]
+        producer = self.manager.create_kv_cache(None, producer_prompt)
+        consumer = self.manager.create_kv_cache(None, consumer_prompt)
+        producer_stream_holder = CachedCudaStream()
+        consumer_stream_holder = CachedCudaStream()
+        producer_stream = cast(CudaStream, producer_stream_holder.handle)
+        consumer_stream = cast(CudaStream, consumer_stream_holder.handle)
+        cached_cuda_event = get_cached_cuda_event_type()
+        producer_marker = None
+
+        try:
+            self.assertTrue(producer.resume(producer_stream))
+            self.assertTrue(producer.resize(64))
+            with enable_kernel_delay():
+                for _ in range(8):
+                    self.engine.execute([Step(producer, producer_prompt, [])], producer_stream)
+            producer_marker = cached_cuda_event(producer_stream)
+            producer.close()
+
+            self.assertTrue(consumer.resume(producer_stream))
+            self.assertTrue(consumer.resize(256))
+            self.assertTrue(consumer.has_scratch_slots)
+
+            consumer.cuda_stream = consumer_stream
+            self.assertTrue(consumer.resize(288, 256))
+            self.assertFalse(consumer.has_scratch_slots)
+
+            consumer_marker = cached_cuda_event(consumer_stream)
+            consumer_marker.synchronize()
+            self.assertTrue(producer_marker.query_complete())
+        finally:
+            producer_stream_holder.synchronize()
+            consumer_stream_holder.synchronize()
+            if producer_marker is not None and not producer_marker.is_closed():
+                producer_marker.synchronize()
+            if producer.status != _KVCache.Status.CLOSED:
+                producer.close()
+            if consumer.status != _KVCache.Status.CLOSED:
+                consumer.close()
+            producer_stream_holder.synchronize()
+            consumer_stream_holder.synchronize()
 
     def test_request_scratch_toggle_for_two_round_inference(self):
         self._prepare_scratch(num_layers=8, window_size=32, tokens_per_block=32, gpu_quota=16 << 20)

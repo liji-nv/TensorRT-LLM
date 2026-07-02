@@ -262,8 +262,9 @@ struct KVCacheManagerConfig
     bool enablePartialReuse = true;
 
     // Constraint-based memory partitioning.
-    std::vector<BatchDesc> constraints;   // batches that must always be supportable
-    std::optional<BatchDesc> typicalStep; // typical step for initial ratio computation
+    std::vector<BatchDesc> constraints;                 // batches that must always be supportable
+    std::optional<BatchDesc> typicalStep;               // typical step for initial ratio computation
+    std::optional<std::vector<float>> initialPoolRatio; // explicit initial ratio, overrides inferred sizing inputs
 
     // Interval (in tokens) at which SSM state is snapshotted for prefix reuse.
     // Must be a positive multiple of tokensPerBlock. Only takes effect when SSM layers are present.
@@ -274,6 +275,9 @@ struct KVCacheManagerConfig
     // layer, reducing peak memory. Trade-off: KV cache reuse is degraded because scratch blocks
     // have no preserved data after the step.
     std::optional<SwaScratchReuseConfig> swaScratchReuse;
+
+    // Collect V2 KV cache allocation, reuse, and transfer statistics.
+    bool enableStats = true;
 
     bool enableSwaScratchReuse() const noexcept
     {

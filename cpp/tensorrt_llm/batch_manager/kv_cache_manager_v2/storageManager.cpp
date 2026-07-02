@@ -30,6 +30,7 @@
 #include <cstddef>
 #include <numeric>
 #include <set>
+#include <string>
 #include <utility>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -112,8 +113,10 @@ TypedVec<LifeCycleId, TypedVec<PoolIndex, int>> computeSlotToPageIndices(Storage
 
 StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfig const& config, int tokensPerBlock,
     std::optional<SwaScratchReuseConfig> swaScratchReuse, std::optional<BatchDesc> const& typicalBatch,
-    std::vector<BatchDesc> const& constraints)
+    std::vector<BatchDesc> const& constraints, std::optional<std::vector<float>> const& initialPoolRatio,
+    std::shared_ptr<EventSink> eventSink)
     : mLifeCycles(lifeCycles)
+    , mEventSink(std::move(eventSink))
     , mStorageConfig(config)
     , mSwaScratchReuse(std::move(swaScratchReuse))
 {
@@ -157,12 +160,34 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     size_t gpuQuota = cacheTierQuota(config.cacheTiers[kGpuLevel]);
     size_t gpuGranularity = CacheLevelManager::cacheTierGranularity(CacheTier::GPU_MEM, gpuQuota);
 
-    // Compute min_slots from constraints.
-    mMinSlots = computeMinSlotsFromConstraints(constraints, tokensPerBlock, mSwaScratchReuse);
+    // Explicit ratios override constraints for both initial sizing and minimum slot counts.
+    mMinSlots = computeMinSlotsFromConstraints(
+        initialPoolRatio.has_value() ? std::vector<BatchDesc>{} : constraints, tokensPerBlock, mSwaScratchReuse);
 
-    // Compute init_ratio from typical_batch, constraints, or fallback.
+    // Compute init_ratio from explicit config, typical_batch, constraints, or fallback.
     TypedVec<PoolGroupIndex, float> initRatio;
-    if (typicalBatch.has_value())
+    if (initialPoolRatio.has_value())
+    {
+        if (initialPoolRatio->size() != toSizeT(numPoolGroups()))
+        {
+            throw std::invalid_argument("initial_pool_ratio length must match number of pool groups ("
+                + std::to_string(toSizeT(numPoolGroups())) + "), got " + std::to_string(initialPoolRatio->size()));
+        }
+        if (std::any_of(initialPoolRatio->begin(), initialPoolRatio->end(), [](float ratio) { return ratio <= 0.0F; }))
+        {
+            throw std::invalid_argument("initial_pool_ratio values must be positive");
+        }
+
+        constexpr double kExpectedRatioSum = 1.0;
+        constexpr double kRatioSumTolerance = 1e-6;
+        double const ratioSum = std::accumulate(initialPoolRatio->begin(), initialPoolRatio->end(), 0.0);
+        if (!std::isfinite(ratioSum) || std::abs(ratioSum - kExpectedRatioSum) > kRatioSumTolerance)
+        {
+            throw std::invalid_argument("initial_pool_ratio values must sum to 1.0");
+        }
+        initRatio = TypedVec<PoolGroupIndex, float>(*initialPoolRatio);
+    }
+    else if (typicalBatch.has_value())
     {
         initRatio = ratioFromBatch(*typicalBatch, tokensPerBlock, mSwaScratchReuse, gpuGranularity);
     }
@@ -211,8 +236,9 @@ void StorageManager::destroy()
 // newSlots
 // ---------------------------------------------------------------------------
 
-TypedVec<LifeCycleId, std::vector<Slot>> StorageManager::newSlots(
-    CacheLevel level, TypedVec<LifeCycleId, SlotCount> const& numSlotsPerLc)
+TypedVec<LifeCycleId, std::vector<Slot>> StorageManager::newSlots(CacheLevel level,
+    TypedVec<LifeCycleId, SlotCount> const& numSlotsPerLc, MigrationRecorder const& migrationRecorder,
+    DropRecorder const& dropRecorder)
 {
     TLLM_CHECK_DEBUG(numSlotsPerLc.size() == numLifeCycles());
     auto& storage = *mLevels.at(level).storage;
@@ -242,7 +268,7 @@ TypedVec<LifeCycleId, std::vector<Slot>> StorageManager::newSlots(
 
     if (needMore)
     {
-        prepareFreeSlots(level, pgNumSlots);
+        prepareFreeSlots(level, pgNumSlots, migrationRecorder, dropRecorder);
     }
 
     // A14: post-condition — free-slot counts satisfy requirements.
@@ -276,12 +302,14 @@ TypedVec<LifeCycleId, std::vector<Slot>> StorageManager::newSlots(
 }
 
 TypedVec<LifeCycleId, std::vector<Slot>> StorageManager::newGpuSlots(
-    TypedVec<LifeCycleId, SlotCount> const& numSlotsPerLc)
+    TypedVec<LifeCycleId, SlotCount> const& numSlotsPerLc, MigrationRecorder const& migrationRecorder,
+    DropRecorder const& dropRecorder)
 {
-    return newSlots(kGpuLevel, numSlotsPerLc);
+    return newSlots(kGpuLevel, numSlotsPerLc, migrationRecorder, dropRecorder);
 }
 
-std::vector<Slot> StorageManager::newSlotsForPoolGroup(CacheLevel level, PoolGroupIndex pgIdx, SlotCount numSlots)
+std::vector<Slot> StorageManager::newSlotsForPoolGroup(CacheLevel level, PoolGroupIndex pgIdx, SlotCount numSlots,
+    MigrationRecorder const& migrationRecorder, DropRecorder const& dropRecorder)
 {
     if (numSlots < 0)
     {
@@ -292,7 +320,7 @@ std::vector<Slot> StorageManager::newSlotsForPoolGroup(CacheLevel level, PoolGro
     {
         TypedVec<PoolGroupIndex, SlotCount> requirements(numPoolGroups(), 0);
         requirements.at(pgIdx) = numSlots;
-        prepareFreeSlots(level, requirements);
+        prepareFreeSlots(level, requirements, migrationRecorder, dropRecorder);
     }
     TLLM_CHECK_DEBUG(numSlots <= storage.numFreeSlots(pgIdx));
     return storage.allocateMultiple(pgIdx, numSlots);
@@ -345,7 +373,8 @@ void StorageManager::excludeFromEviction(Page& page)
 // prepareFreeSlots
 // ---------------------------------------------------------------------------
 
-void StorageManager::prepareFreeSlots(CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& requirements)
+void StorageManager::prepareFreeSlots(CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& requirements,
+    MigrationRecorder const& migrationRecorder, DropRecorder const& dropRecorder)
 {
     TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotCount>> goals(numCacheLevels());
     for (CacheLevel lvl{0}; lvl < goals.size(); ++lvl)
@@ -358,10 +387,11 @@ void StorageManager::prepareFreeSlots(CacheLevel level, TypedVec<PoolGroupIndex,
     }
 
     TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> fallenPages(numPoolGroups());
-    _prepareFreeSlots(goals, level, fallenPages);
+    _prepareFreeSlots(goals, level, fallenPages, migrationRecorder, dropRecorder);
 }
 
-void StorageManager::forceEvict(CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& minNumPages)
+void StorageManager::forceEvict(
+    CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& minNumPages, DropRecorder const& dropRecorder)
 {
     auto evicted = mLevels.at(level).controller.evict(minNumPages);
 
@@ -373,6 +403,16 @@ void StorageManager::forceEvict(CacheLevel level, TypedVec<PoolGroupIndex, SlotC
             for (auto const& page : pages)
             {
                 TLLM_CHECK_DEBUG_WITH_INFO(page->status() == PageStatus::DROPPABLE, "Corrupted eviction controller");
+            }
+        }
+        if (dropRecorder)
+        {
+            for (auto const& pages : evicted)
+            {
+                if (!pages.empty())
+                {
+                    dropRecorder(pages, level);
+                }
             }
         }
         return;
@@ -391,7 +431,7 @@ void StorageManager::forceEvict(CacheLevel level, TypedVec<PoolGroupIndex, SlotC
         for (auto& sp : evicted.at(pgIdx))
             fallen.at(pgIdx).push_back(sp);
     }
-    _prepareFreeSlots(goals, nextLvl, fallen);
+    _prepareFreeSlots(goals, nextLvl, fallen, MigrationRecorder{}, dropRecorder);
 }
 
 // ---------------------------------------------------------------------------
@@ -399,7 +439,8 @@ void StorageManager::forceEvict(CacheLevel level, TypedVec<PoolGroupIndex, SlotC
 // ---------------------------------------------------------------------------
 
 void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotCount>>& goals,
-    CacheLevel lvlId, TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>>& fallenPages)
+    CacheLevel lvlId, TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>>& fallenPages,
+    MigrationRecorder const& migrationRecorder, DropRecorder const& dropRecorder)
 {
     // A7: goals dimensions must match [numCacheLevels][numPoolGroups].
     if (TLLM_UNLIKELY(gDebug))
@@ -469,6 +510,10 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
                 std::all_of(ev.begin(), ev.end(), [](auto const& p) { return p->status() == PageStatus::DROPPABLE; }),
                 "Evicted page at last level must be DROPPABLE");
             // Drop droppable evicted pages (GC).
+            if (dropRecorder && !ev.empty())
+            {
+                dropRecorder(ev, lvlId);
+            }
             ev.clear();
             SlotCount const newFree = storage.numFreeSlots(pgIdx);
             TLLM_CHECK_DEBUG(newFree >= numEvicted + oldFree);
@@ -519,7 +564,7 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
                 fp.erase(fp.end() - static_cast<std::ptrdiff_t>(numAccepted), fp.end());
             }
         }
-        _prepareFreeSlots(goals, nextLvl, fallenPages);
+        _prepareFreeSlots(goals, nextLvl, fallenPages, migrationRecorder, dropRecorder);
     }
 
     // A13: all fallen pages must have been consumed.
@@ -535,7 +580,7 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
 
         for (auto& [srcLvl, pages] : bySrcLevel)
         {
-            _batchedMigrate(pgIdx, lvlId, srcLvl, pages, /*updateSrc=*/true);
+            _batchedMigrate(pgIdx, lvlId, srcLvl, pages, /*updateSrc=*/true, migrationRecorder);
             for (auto const& p : pages)
             {
                 if (isLast && p->status() == PageStatus::HELD)
@@ -551,7 +596,8 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
 // ---------------------------------------------------------------------------
 
 void StorageManager::_batchedMigrate(PoolGroupIndex pgIdx, CacheLevel dstLevel, CacheLevel srcLevel,
-    std::vector<SharedPtr<Page>> const& srcPages, bool updateSrc, bool defrag)
+    std::vector<SharedPtr<Page>> const& srcPages, bool updateSrc, MigrationRecorder const& migrationRecorder,
+    bool defrag)
 {
     TLLM_CHECK_DEBUG(defrag || dstLevel != srcLevel);
     SlotCount const numSlots = slotCountValueFromSize(srcPages.size());
@@ -610,6 +656,13 @@ void StorageManager::_batchedMigrate(PoolGroupIndex pgIdx, CacheLevel dstLevel, 
         } // ~Scope records finish event
 
         CachedCudaEvent finishEvent = tempStream.takeFinishEvent();
+        if (migrationRecorder && !defrag)
+        {
+            migrationRecorder(srcPages, dstSlots, srcLevel, dstLevel);
+        }
+        std::set<std::pair<std::string, int>> emittedCacheLevelUpdates;
+        bool const emitCacheLevelUpdates
+            = updateSrc && !defrag && srcLevel != dstLevel && static_cast<bool>(mEventSink);
         for (std::size_t i = 0; i < srcPages.size(); ++i)
         {
             dstSlots.at(i).readyEvent = finishEvent;
@@ -630,6 +683,19 @@ void StorageManager::_batchedMigrate(PoolGroupIndex pgIdx, CacheLevel dstLevel, 
                 // Transfer dst slot ownership to the page.
                 srcPages.at(i)->setSlot(dstSlots.at(i));
                 srcPages.at(i)->cacheLevel = dstLevel;
+                if (emitCacheLevelUpdates && srcPages.at(i)->isCommitted())
+                {
+                    auto const& page = static_cast<CommittedPage const&>(*srcPages.at(i));
+                    Block const* block = page.block;
+                    std::string const blockKey = block
+                        ? std::string(reinterpret_cast<char const*>(block->key.data()), block->key.size())
+                        : std::string{};
+                    if (block && !block->isOrphan()
+                        && emittedCacheLevelUpdates.insert({blockKey, page.lifeCycle.value()}).second)
+                    {
+                        mEventSink->addCacheLevelUpdated(block->key, srcLevel, dstLevel, page.lifeCycle);
+                    }
+                }
                 if (wasScheduled)
                     scheduleForEviction(*srcPages.at(i));
             }
@@ -647,7 +713,8 @@ void StorageManager::_batchedMigrate(PoolGroupIndex pgIdx, CacheLevel dstLevel, 
 // batchedMigrateToGpu
 // ---------------------------------------------------------------------------
 
-void StorageManager::batchedMigrateToGpu(std::vector<BatchedLockTarget> const& targets, KvCache& /*kvCache*/)
+void StorageManager::batchedMigrateToGpu(
+    std::vector<BatchedLockTarget> const& targets, KvCache& /*kvCache*/, MigrationRecorder const& migrationRecorder)
 {
     // Group by (srcLevel, pgIdx).
     std::map<std::pair<CacheLevel, PoolGroupIndex>, std::vector<SharedPtr<Page>>> groups;
@@ -659,7 +726,7 @@ void StorageManager::batchedMigrateToGpu(std::vector<BatchedLockTarget> const& t
         groups[{t.page->cacheLevel, pg}].push_back(t.page);
     }
     for (auto& [key, pages] : groups)
-        _batchedMigrate(key.second, kGpuLevel, key.first, pages, /*updateSrc=*/true);
+        _batchedMigrate(key.second, kGpuLevel, key.first, pages, /*updateSrc=*/true, migrationRecorder);
 }
 
 void StorageManager::prefetch(
@@ -936,7 +1003,7 @@ void StorageManager::shrinkPoolGroup(
         "Overflow page cache level mismatch");
 
     // Defragment: migrate overflow pages to free slots within the same level.
-    _batchedMigrate(pgIdx, level, level, overflowPages, /*updateSrc=*/true, /*defrag=*/true);
+    _batchedMigrate(pgIdx, level, level, overflowPages, /*updateSrc=*/true, MigrationRecorder{}, /*defrag=*/true);
 
     // A18: post-defrag overflow assertion — overflow slot count matches expectations.
     TLLM_CHECK_DEBUG_WITH_INFO(allocator.numOverflowSlots() == allocator.numActiveSlots() - allocator.targetCapacity(),

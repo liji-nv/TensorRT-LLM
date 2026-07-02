@@ -53,9 +53,11 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     KVCacheIterationStatsDelta,
     LayerId,
     PageIndexMode,
+    PoolGroupPeakBlockStats,
     ReuseScope,
     SwaScratchReuseConfig,
     TokenIdExt,
+    _cpp_introspection,
     _KVCache,
     exact_div,
     gen_multimodal_cache_key_tokens,
@@ -1241,6 +1243,13 @@ class KVCacheManagerV2(BaseResourceManager):
         }
 
     def _format_kv_cache_pool_lifecycle_entry(self, layer_id: LayerId, role: DataRole) -> str:
+        if _cpp_introspection is not None:
+            lifecycle_id = self.impl.get_layer_group_id(layer_id)
+            layer = self.kv_cache_manager_py_config.layers[int(layer_id)]
+            return (
+                f"role={str(role)}, lifecycle_id={int(lifecycle_id)}, "
+                f"sliding_window_size={layer.sliding_window_size}"
+            )
         attr = self.impl._storage.get_buffer_attr(layer_id, role)
         pool_group_id = self.impl._storage.get_pool_group_index(attr.life_cycle_id)
         lifecycle = self.impl._life_cycles.get_life_cycle(attr.life_cycle_id)
@@ -1473,9 +1482,12 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_cache_config: KvCacheConfig,
         *,
         tokens_per_block: int,
-        vocab_size: int,
+        vocab_size: int | None,
         cache_tiers: List[CacheTierConfig],
     ) -> KVCacheManagerConfigPy:
+        # Kept in the virtual method contract for cache-manager subclasses.
+        # The generic C++ config no longer stores the vocabulary size.
+        del vocab_size
         buffer_type = [Role.KEY]
         if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
             buffer_type.append(Role.VALUE)
@@ -1534,7 +1546,6 @@ class KVCacheManagerV2(BaseResourceManager):
 
         return KVCacheManagerConfigPy(
             tokens_per_block=tokens_per_block,
-            vocab_size=vocab_size,
             cache_tiers=cache_tiers,
             max_util_for_resume=kv_cache_config.max_util_for_resume,
             enable_stats=self.enable_stats,
@@ -2182,14 +2193,52 @@ class KVCacheManagerV2(BaseResourceManager):
             return None
         return self._stats_window_size(life_cycle.window_size)
 
+    def _get_storage_statistics(self, cache_level: CacheLevel):
+        if _cpp_introspection is not None:
+            return _cpp_introspection.storage_statistics(self.impl, cache_level)
+        return self.impl._storage.get_statistics(cache_level)
+
+    def _stats_life_cycle_metadata(self) -> dict[int, tuple[int, Optional[int], str]]:
+        if _cpp_introspection is not None:
+            pool_groups_by_life_cycle = _cpp_introspection.life_cycle_pool_group_indices(self.impl)
+        else:
+            pool_groups_by_life_cycle = [
+                self.impl._storage.get_pool_group_index(LifeCycleId(life_cycle_id))
+                for life_cycle_id in range(len(self.impl.layer_grouping))
+            ]
+
+        metadata: dict[int, tuple[int, Optional[int], str]] = {}
+        for life_cycle_id, layer_ids in enumerate(self.impl.layer_grouping):
+            if not layer_ids:
+                continue
+            layer = self.kv_cache_manager_py_config.layers[int(layer_ids[0])]
+            is_attention = isinstance(layer, AttentionLayerConfig)
+            metadata[life_cycle_id] = (
+                int(pool_groups_by_life_cycle[life_cycle_id]),
+                self._stats_window_size(layer.sliding_window_size) if is_attention else None,
+                "attention" if is_attention else "ssm",
+            )
+        return metadata
+
     def _storage_pool_groups_by_window(self) -> dict[int, set[int]]:
         pool_groups_by_window: dict[int, set[int]] = defaultdict(set)
-        for life_cycle_id, life_cycle in self.impl._life_cycles.attention_life_cycles():
-            pool_group_id = self.impl._storage.get_pool_group_index(life_cycle_id)
-            pool_groups_by_window[self._stats_window_size(life_cycle.window_size)].add(
-                int(pool_group_id)
-            )
+        for pool_group_id, window_size, _ in self._stats_life_cycle_metadata().values():
+            if window_size is not None:
+                pool_groups_by_window[window_size].add(pool_group_id)
         return pool_groups_by_window
+
+    def _get_and_reset_iteration_peak_block_stats(self, cache_level: CacheLevel):
+        get_peak_stats = getattr(self.impl, "get_and_reset_iteration_peak_block_stats", None)
+        if get_peak_stats is not None:
+            return get_peak_stats(cache_level)
+        return [
+            PoolGroupPeakBlockStats(
+                available=stats.available,
+                unavailable=stats.total - stats.available,
+                evictable=stats.evictable,
+            )
+            for stats in self._get_storage_statistics(cache_level)
+        ]
 
     @staticmethod
     def _windows_by_pool_group(
@@ -2307,7 +2356,7 @@ class KVCacheManagerV2(BaseResourceManager):
         return stats
 
     def _collect_iteration_stats_deltas(
-        self, raw_iteration_stats, storage
+        self, raw_iteration_stats, life_cycle_metadata
     ) -> tuple[dict, dict, dict, dict]:
         reuse_deltas_by_window: dict[int, KVCacheIterationStatsDelta] = {}
         reuse_deltas_by_life_cycle: dict[int, KVCacheIterationStatsDelta] = {}
@@ -2315,9 +2364,7 @@ class KVCacheManagerV2(BaseResourceManager):
         pool_group_deltas: dict[int, KVCacheIterationStatsDelta] = {}
 
         for life_cycle_id, delta in raw_iteration_stats.items():
-            life_cycle = self.impl._life_cycles.get_life_cycle(life_cycle_id)
-            pool_group_id = int(storage.get_pool_group_index(life_cycle_id))
-            window_size = self._stats_life_cycle_window_size(life_cycle)
+            pool_group_id, window_size, _ = life_cycle_metadata[int(life_cycle_id)]
 
             pool_group_delta = self._filter_iteration_stats_delta(
                 delta, KV_CACHE_ITERATION_STATS_POOL_GROUP_FIELDS
@@ -2383,9 +2430,15 @@ class KVCacheManagerV2(BaseResourceManager):
         secondary_peak_stats_by_level,
         pool_group_delta,
     ) -> KVCacheV2PoolGroupIterationStats:
+        primary_pool_group_stats = primary_stats[pool_group_id]
+        slot_size = (
+            primary_pool_group_stats.slot_sizes
+            if hasattr(primary_pool_group_stats, "slot_sizes")
+            else primary_pool_group_stats.slot_size
+        )
         return KVCacheV2PoolGroupIterationStats(
             pool_group_id=pool_group_id,
-            slot_size=tuple(primary_stats[pool_group_id].slot_size),
+            slot_size=tuple(slot_size),
             window_sizes=windows_by_pool_group.get(pool_group_id, ()),
             stats=self._build_iteration_stats(
                 (pool_group_id,),
@@ -2401,21 +2454,19 @@ class KVCacheManagerV2(BaseResourceManager):
     def _build_life_cycle_iteration_stats(
         self,
         life_cycle_id: int,
-        storage,
+        life_cycle_metadata,
         primary_stats,
         secondary_stats_by_level,
         primary_peak_stats,
         secondary_peak_stats_by_level,
         reuse_delta,
     ) -> KVCacheV2LifeCycleIterationStats:
-        typed_life_cycle_id = LifeCycleId(life_cycle_id)
-        life_cycle = self.impl._life_cycles.get_life_cycle(typed_life_cycle_id)
-        pool_group_id = int(storage.get_pool_group_index(typed_life_cycle_id))
+        pool_group_id, window_size, kind = life_cycle_metadata[life_cycle_id]
         return KVCacheV2LifeCycleIterationStats(
             life_cycle_id=life_cycle_id,
             pool_group_id=pool_group_id,
-            window_size=self._stats_life_cycle_window_size(life_cycle),
-            kind="attention" if isinstance(life_cycle, AttnLifeCycle) else "ssm",
+            window_size=window_size,
+            kind=kind,
             stats=self._build_iteration_stats(
                 (),
                 primary_stats,
@@ -2429,7 +2480,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def get_kv_cache_stats(self):
         kv_cache_stats = KvCacheStats()
-        pool_group_stats = self.impl._storage.get_statistics(GPU_LEVEL)
+        pool_group_stats = self._get_storage_statistics(GPU_LEVEL)
         max_num_blocks = sum(stat.total for stat in pool_group_stats)
         free_num_blocks = sum(stat.available for stat in pool_group_stats)
         committed_stats = self.impl.get_committed_stats()
@@ -2471,29 +2522,29 @@ class KVCacheManagerV2(BaseResourceManager):
         if not self.enable_stats:
             return None
 
-        storage = self.impl._storage
+        life_cycle_metadata = self._stats_life_cycle_metadata()
         pool_groups_by_window = self._storage_pool_groups_by_window()
         windows_by_pool_group = self._windows_by_pool_group(pool_groups_by_window)
         raw_iteration_stats = self.impl.get_and_reset_iteration_stats()
-        primary_peak_stats = self.impl.get_and_reset_iteration_peak_block_stats(GPU_LEVEL)
+        primary_peak_stats = self._get_and_reset_iteration_peak_block_stats(GPU_LEVEL)
+        num_cache_levels = len(self.impl.cache_tier_list)
         secondary_peak_stats_by_level = [
-            self.impl.get_and_reset_iteration_peak_block_stats(CacheLevel(level))
-            for level in range(1, int(storage.num_cache_levels))
+            self._get_and_reset_iteration_peak_block_stats(CacheLevel(level))
+            for level in range(1, num_cache_levels)
         ]
         (
             reuse_deltas_by_window,
             reuse_deltas_by_life_cycle,
             pool_group_deltas_by_window,
             pool_group_deltas,
-        ) = self._collect_iteration_stats_deltas(raw_iteration_stats, storage)
+        ) = self._collect_iteration_stats_deltas(raw_iteration_stats, life_cycle_metadata)
 
         windows = set(pool_groups_by_window)
         windows.update(reuse_deltas_by_window)
         windows.update(pool_group_deltas_by_window)
-        primary_stats = storage.get_statistics(GPU_LEVEL)
+        primary_stats = self._get_storage_statistics(GPU_LEVEL)
         secondary_stats_by_level = [
-            storage.get_statistics(CacheLevel(level))
-            for level in range(1, int(storage.num_cache_levels))
+            self._get_storage_statistics(CacheLevel(level)) for level in range(1, num_cache_levels)
         ]
 
         stats_by_window = {
@@ -2528,7 +2579,7 @@ class KVCacheManagerV2(BaseResourceManager):
         stats_by_life_cycle = {
             life_cycle_id: self._build_life_cycle_iteration_stats(
                 life_cycle_id,
-                storage,
+                life_cycle_metadata,
                 primary_stats,
                 secondary_stats_by_level,
                 primary_peak_stats,
