@@ -64,6 +64,12 @@ struct KVCacheStatsDelta
     {
         return allocTotalBlocks == 0 && allocNewBlocks == 0 && reusedBlocks == 0 && missedBlocks == 0;
     }
+
+    [[nodiscard]] bool operator==(KVCacheStatsDelta const& other) const noexcept
+    {
+        return allocTotalBlocks == other.allocTotalBlocks && allocNewBlocks == other.allocNewBlocks
+            && reusedBlocks == other.reusedBlocks && missedBlocks == other.missedBlocks;
+    }
 };
 
 struct KVCacheIterationStatsDelta
@@ -150,6 +156,20 @@ struct KVCacheIterationStatsDelta
         }
         return static_cast<double>(iterReusedBlocks) / static_cast<double>(total);
     }
+
+    [[nodiscard]] bool operator==(KVCacheIterationStatsDelta const& other) const noexcept
+    {
+        return iterAllocTotalBlocks == other.iterAllocTotalBlocks && iterAllocNewBlocks == other.iterAllocNewBlocks
+            && iterReusedBlocks == other.iterReusedBlocks && iterFullReusedBlocks == other.iterFullReusedBlocks
+            && iterPartialReusedBlocks == other.iterPartialReusedBlocks && iterMissedBlocks == other.iterMissedBlocks
+            && iterGenAllocBlocks == other.iterGenAllocBlocks && iterOnboardBlocks == other.iterOnboardBlocks
+            && iterOnboardBytes == other.iterOnboardBytes && iterOffloadBlocks == other.iterOffloadBlocks
+            && iterOffloadBytes == other.iterOffloadBytes
+            && iterIntraDeviceCopyBlocks == other.iterIntraDeviceCopyBlocks
+            && iterIntraDeviceCopyBytes == other.iterIntraDeviceCopyBytes
+            && iterHostDroppedBlocks == other.iterHostDroppedBlocks
+            && iterHostDroppedBytes == other.iterHostDroppedBytes;
+    }
 };
 
 using IterationStatsByLifeCycle = std::unordered_map<LifeCycleId, KVCacheIterationStatsDelta>;
@@ -159,6 +179,11 @@ struct PoolGroupPeakBlockStats
     SlotCount available = 0;
     SlotCount unavailable = 0;
     SlotCount evictable = 0;
+
+    [[nodiscard]] bool operator==(PoolGroupPeakBlockStats const& other) const noexcept
+    {
+        return available == other.available && unavailable == other.unavailable && evictable == other.evictable;
+    }
 };
 
 using PeakBlockStatsByPoolGroup = TypedVec<PoolGroupIndex, PoolGroupPeakBlockStats>;

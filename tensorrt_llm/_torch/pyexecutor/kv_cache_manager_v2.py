@@ -17,7 +17,6 @@ import math
 import os
 import sys
 from collections import OrderedDict, defaultdict
-from dataclasses import fields
 from typing import TYPE_CHECKING, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple, Union
 
 import torch
@@ -38,6 +37,7 @@ from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils impo
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.runtime.kv_cache_hash import get_effective_kv_cache_event_hash_algo
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+    _KV_CACHE_ITERATION_STATS_DELTA_FIELDS,
     BAD_PAGE_INDEX,
     CACHE_LEVEL1,
     DEFAULT_BEAM_INDEX,
@@ -100,9 +100,7 @@ from .scheduler import ScheduledRequests
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
 
-KV_CACHE_ITERATION_STATS_DELTA_FIELDS = tuple(
-    field.name for field in fields(KVCacheIterationStatsDelta)
-)
+KV_CACHE_ITERATION_STATS_DELTA_FIELDS = _KV_CACHE_ITERATION_STATS_DELTA_FIELDS
 KV_CACHE_ITERATION_STATS_REUSE_FIELDS = (
     "iter_reused_blocks",
     "iter_full_reused_blocks",

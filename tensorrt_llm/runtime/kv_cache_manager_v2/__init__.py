@@ -31,7 +31,6 @@ from ._event_manager import (
     KVCacheUpdatedData,
     UniqueToken,
 )
-from ._stats import KVCacheIterationStatsDelta, KVCacheStatsDelta
 
 _BACKEND = os.environ.get("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp").lower()
 
@@ -86,6 +85,11 @@ if _BACKEND == "python":
     from ._core._kv_cache import _Status as KvCacheStatus  # noqa: F401
     from ._exceptions import OutOfPagesError  # noqa: F401
     from ._life_cycle_registry import LayerGroupId, LifeCycleId  # noqa: F401
+    from ._stats import (  # noqa: F401
+        _KV_CACHE_ITERATION_STATS_DELTA_FIELDS,
+        KVCacheIterationStatsDelta,
+        KVCacheStatsDelta,
+    )
     from ._storage import BufferId  # noqa: F401
     from ._storage._config import CoalescedBuffer, SlotDesc, SlotDescVariant  # noqa: F401
     from ._storage._core import PoolGroupIndex, PoolIndex  # noqa: F401
@@ -138,18 +142,22 @@ else:
     ExpandedBuffer = _cpp.ExpandedBuffer
     HostCacheTierConfig = _cpp.HostCacheTierConfig
     KVCacheDesc = _cpp.KVCacheDesc
+    KVCacheIterationStatsDelta = _cpp.KVCacheIterationStatsDelta
     KVCacheManager = _cpp.KVCacheManager
     KVCacheManagerConfig = _cpp.KVCacheManagerConfig
+    KVCacheStatsDelta = _cpp.KVCacheStatsDelta
     KvCacheStatus = _cpp.KvCacheStatus
     OutOfPagesError = _cpp.OutOfPagesError
     PageStatus = _cpp.PageStatus
     PoolDesc = _cpp.PoolDesc
     PoolGroupDesc = _cpp.PoolGroupDesc
+    PoolGroupPeakBlockStats = _cpp.PoolGroupPeakBlockStats
     SlotDesc = _cpp.SlotDesc
     SlotDescVariant = _cpp.SlotDescVariant
     SsmLayerConfig = _cpp.SsmLayerConfig
     _KVCache = _cpp._KVCache
     _cpp_introspection = getattr(_cpp, "_introspection", None)
+    _KV_CACHE_ITERATION_STATS_DELTA_FIELDS = tuple(KVCacheIterationStatsDelta._field_names)
 
     HelixConfig = getattr(_cpp, "HelixConfig", None)
     PageIndexConverter = getattr(_cpp, "PageIndexConverter", None)
@@ -203,11 +211,6 @@ else:
     class PageIndexMode(int):
         SHARED = 0
         PER_LAYER = 1
-
-    class PoolGroupPeakBlockStats(NamedTuple):
-        available: int
-        unavailable: int
-        evictable: int
 
     def gen_multimodal_cache_key_tokens(
         id_offset: int, multi_modal_data_digest: bytes, num_tokens: int, token_offset: int = 0
