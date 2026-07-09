@@ -385,6 +385,10 @@ TypedVec<LayerGroupId, std::vector<LayerId>> KvCacheManager::layerGrouping() con
     {
         result.at(lc).push_back(lid);
     }
+    for (auto& layers : result)
+    {
+        std::sort(layers.begin(), layers.end());
+    }
     return result;
 }
 

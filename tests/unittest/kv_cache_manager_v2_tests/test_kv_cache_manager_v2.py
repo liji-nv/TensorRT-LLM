@@ -323,6 +323,28 @@ def create_config(
     )
 
 
+class TestLayerGrouping(unittest.TestCase):
+    def test_layers_are_ordered_within_each_group(self) -> None:
+        init_cuda_once()
+        config = create_config(
+            tokens_per_block=32,
+            gpu_quota=32 << 20,
+            host_quota=0,
+            disk_quota=0,
+            num_layers=8,
+            window_size=None,
+            sink_tokens=0,
+        )
+        manager = KVCacheManager(config)
+        try:
+            layer_groups = [list(group) for group in manager.layer_grouping]
+            self.assertTrue(any(len(group) > 1 for group in layer_groups))
+            for group in layer_groups:
+                self.assertEqual(group, sorted(group))
+        finally:
+            manager.shutdown()
+
+
 class TestKVCacheManagerV2(unittest.TestCase):
     engine: FakeEngine
     cfg: KVCacheManagerConfig
